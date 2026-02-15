@@ -1,5 +1,5 @@
+# requirements.txt
 python-telegram-bot==20.8
-pyTelegramBotAPI  # if any old code
 aiohttp
 requests
 python-dotenv

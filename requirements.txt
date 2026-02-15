@@ -1,6 +1,7 @@
-python-telegram-bot==22.6
+python-telegram-bot==20.8
+pyTelegramBotAPI  # if any old code
 aiohttp
 requests
+python-dotenv
 web3
 py-clob-client
-youtube-transcript-api

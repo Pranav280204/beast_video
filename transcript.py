@@ -3,9 +3,10 @@ import re
 import time
 import asyncio
 import aiohttp
-from datetime import datetime, timezone
+import json
 import requests
-from youtube_transcript_api import YouTubeTranscriptApi, NoTranscriptFound, TranscriptsDisabled
+import xml.etree.ElementTree as ET
+from datetime import datetime, timezone
 from web3 import Web3
 from py_clob_client.client import ClobClient
 from py_clob_client.clob_types import MarketOrderArgs, OrderType
@@ -19,6 +20,7 @@ from telegram.ext import (
 
 # ---------- Config ----------
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+YT_TRANSCRIPT_IO_TOKEN = os.getenv("YT_TRANSCRIPT_IO_TOKEN")
 PRIVATE_KEY = os.getenv("PRIVATE_KEY")
 WALLET_ADDRESS = os.getenv("WALLET_ADDRESS")
 DRY_RUN = os.getenv("DRY_RUN", "True").lower() == "true"
@@ -27,14 +29,9 @@ GAMMA_API = "https://gamma-api.polymarket.com"
 CLOB_API = "https://clob.polymarket.com"
 POLYGON_RPC = os.getenv("POLYGON_RPC", "https://polygon-rpc.com/")
 CONDITIONAL_TOKENS = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"
-
-# YouTube
-YT_API_KEYS = [k.strip() for k in os.getenv("YOUTUBE_API_KEYS", "").split(",") if k.strip()]
 YOUTUBE_CHANNEL_ID = os.getenv("YOUTUBE_CHANNEL_ID", "UCX6OQ3DkcsbYNE6H8uQQuVA")  # MrBeast
-POLL_INTERVAL = float(os.getenv("POLL_INTERVAL", "300"))  # configurable via env, default 5 min
-HEARTBEAT = float(os.getenv("HEARTBEAT", "300"))  # status every 5 min
-
-# Event
+POLL_INTERVAL = float(os.getenv("POLL_INTERVAL", "300"))
+HEARTBEAT = float(os.getenv("HEARTBEAT", "300"))
 EVENT_SLUG = "what-will-mrbeast-say-during-his-next-youtube-video"
 
 # Market → (phrase_key, threshold)
@@ -46,7 +43,7 @@ MARKET_CONFIG = {
     "Trap": ("Trap", 1),
     "Car / Supercar": ("Car/Supercar", 1),
     "Tesla / Lamborghini": ("Tesla/Lamborghini", 1),
-    "helicopter / Jet": ("helicopter/Jet", 1),  # lowercase for matching
+    "helicopter / Jet": ("helicopter/Jet", 1),
     "Helicopter / Jet": ("helicopter/Jet", 1),
     "Island": ("Island", 1),
     "Mystery Box": ("Mystery Box", 1),
@@ -62,6 +59,8 @@ MARKET_CONFIG = {
 
 if not TELEGRAM_BOT_TOKEN:
     raise ValueError("Missing TELEGRAM_BOT_TOKEN")
+if not YT_TRANSCRIPT_IO_TOKEN:
+    raise ValueError("Missing YT_TRANSCRIPT_IO_TOKEN")
 
 # ---------- Web3 ----------
 w3 = Web3(Web3.HTTPProvider(POLYGON_RPC))
@@ -150,57 +149,61 @@ def format_count_table(counts: dict):
     lines += ["-" * 40, f"{'TOTAL':<30} {total:>8}", "</pre>"]
     return "\n".join(lines)
 
-class YTKeyRotator:
-    def __init__(self, keys):
-        self.keys = keys or []
-        self.idx = 0
-    def get_key(self):
-        if not self.keys: return None
-        k = self.keys[self.idx % len(self.keys)]
-        self.idx += 1
-        return k
-
-async def fetch_latest_video(session, api_key, channel_id):
-    url = "https://www.googleapis.com/youtube/v3/channels"
-    params = {"part": "contentDetails", "id": channel_id, "key": api_key}
-    async with session.get(url, params=params, timeout=10) as resp:
-        if resp.status != 200: return {"error": "channel fetch failed"}
-        data = await resp.json()
-        items = data.get("items", [])
-        if not items: return {"error": "no channel"}
-        uploads_id = items[0]["contentDetails"]["relatedPlaylists"]["uploads"]
-
-    url = "https://www.googleapis.com/youtube/v3/playlistItems"
-    params = {"part": "snippet,contentDetails", "playlistId": uploads_id, "maxResults": 1, "key": api_key}
-    async with session.get(url, params=params, timeout=10) as resp:
-        if resp.status != 200: return {"error": "playlist fetch failed"}
-        data = await resp.json()
-        items = data.get("items", [])
-        if not items: return {"error": "no videos"}
-        item = items[0]
-        video_id = item["contentDetails"]["videoId"]
-        title = item["snippet"]["title"]
-        return {"video_id": video_id, "title": title}
+# ---------- RSS-based latest video fetch ----------
+async def fetch_latest_video_rss(session):
+    feed_url = f"https://www.youtube.com/feeds/videos.xml?channel_id={YOUTUBE_CHANNEL_ID}"
+    async with session.get(feed_url, timeout=10) as resp:
+        if resp.status != 200:
+            return {"error": f"RSS fetch failed: {resp.status}"}
+        text = await resp.text()
+        try:
+            root = ET.fromstring(text)
+            ns = {"atom": "http://www.w3.org/2005/Atom", "yt": "http://www.youtube.com/xml/schemas/2015"}
+            entries = root.findall("atom:entry", ns)
+            if not entries:
+                return {"error": "no videos in feed"}
+            latest = entries[0]
+            video_id = latest.find("yt:videoId", ns).text
+            title = latest.find("atom:title", ns).text
+            return {"video_id": video_id, "title": title}
+        except ET.ParseError as e:
+            return {"error": f"XML parse error: {str(e)}"}
 
 # ---------- Core processing function ----------
 async def process_video(video_id: str, chat_id: int, application: Application):
     url = f"https://www.youtube.com/watch?v={video_id}"
     await application.bot.send_message(chat_id, f"🔍 Processing video: {url}\nFetching transcript...")
 
-    # Fetch transcript
+    # Fetch transcript from youtube-transcript.io API
     transcript_text = None
+    api_url = "https://www.youtube-transcript.io/api/transcripts"
+    payload = {"ids": [video_id]}
+    headers = {
+        "Authorization": f"Basic {YT_TRANSCRIPT_IO_TOKEN}",
+        "Content-Type": "application/json"
+    }
     try:
-        transcript_list = await asyncio.to_thread(YouTubeTranscriptApi.get_transcript, video_id, languages=['en'])
-        transcript_text = " ".join([t['text'] for t in transcript_list]).lower()
-    except (NoTranscriptFound, TranscriptsDisabled):
-        try:
-            transcript_list = await asyncio.to_thread(YouTubeTranscriptApi.get_transcript, video_id)
-            transcript_text = " ".join([t['text'] for t in transcript_list]).lower()
-        except Exception as e2:
-            await application.bot.send_message(chat_id, f"❌ No transcript available: {str(e2)}")
+        r = await asyncio.to_thread(requests.post, api_url, json=payload, headers=headers, timeout=30)
+        r.raise_for_status()
+        data = r.json()
+
+        # Assuming response: { "video_id": [{"text": "...", ...}, ...] }
+        # Adjust if actual format differs (e.g., data["transcripts"][0]["lines"])
+        segments = data.get(video_id, [])
+        if not isinstance(segments, list) or not segments:
+            await application.bot.send_message(chat_id, f"❌ No transcript segments found in API response.")
             return
+
+        transcript_text = " ".join([seg.get("text", "") for seg in segments if seg.get("text")]).lower()
+
+    except requests.exceptions.HTTPError as e:
+        if r.status_code == 429:
+            await application.bot.send_message(chat_id, "❌ Rate limited by youtube-transcript.io (429).")
+        else:
+            await application.bot.send_message(chat_id, f"❌ API HTTP error: {r.status_code}")
+        return
     except Exception as e:
-        await application.bot.send_message(chat_id, f"❌ Transcript error: {str(e)}")
+        await application.bot.send_message(chat_id, f"❌ Transcript API error: {str(e)}")
         return
 
     if not transcript_text.strip():
@@ -248,7 +251,7 @@ async def process_video(video_id: str, chat_id: int, application: Application):
         cnt = counts.get(m["phrase"], 0)
         if cnt >= m["threshold"]:
             resp = await asyncio.to_thread(place_buy_order, m["token_yes"], TRADE_AMOUNT_USDC)
-            status = resp.get("status", resp.get("error", "error"))
+            status = resp.get("status") or resp.get("error", "error")
             trade_log.append(f"🟢 BUY YES ${TRADE_AMOUNT_USDC} on \"{m['question']}\" (count={cnt} ≥ {m['threshold']}) → {status}")
         else:
             trade_log.append(f"⚪ No trade: \"{m['question']}\" (count={cnt} < {m['threshold']})")
@@ -259,44 +262,24 @@ async def process_video(video_id: str, chat_id: int, application: Application):
 # ---------- Auto monitoring ----------
 async def monitor_new_video(application: Application):
     print("Auto monitoring started")
-    rotator = YTKeyRotator(application.bot_data.get("yt_api_keys", YT_API_KEYS))
     chat_id = application.bot_data["chat_id"]
-
-    if not rotator.keys:
-        await application.bot.send_message(chat_id, "⚠️ No YouTube API keys configured. Cannot poll for new videos.")
-        application.bot_data["video_monitoring"] = False
-        return
-
-    await application.bot.send_message(chat_id, "🔄 Starting auto monitoring for new MrBeast video...")
+    await application.bot.send_message(chat_id, "🔄 Starting auto monitoring for new MrBeast video (using RSS feed)...")
 
     last_video_id = None
     last_heartbeat = 0
-
     async with aiohttp.ClientSession() as session:
         # Get initial latest
-        for _ in range(3):
-            key = rotator.get_key()
-            if not key: break
-            res = await fetch_latest_video(session, key, YOUTUBE_CHANNEL_ID)
-            if "video_id" in res:
-                last_video_id = res["video_id"]
-                title = res.get("title", "Unknown")
-                await application.bot.send_message(chat_id, f"Current latest: {title} ({last_video_id})")
-                break
-
-        if not last_video_id:
-            await application.bot.send_message(chat_id, "❌ Failed to get initial latest video.")
+        res = await fetch_latest_video_rss(session)
+        if "video_id" not in res:
+            await application.bot.send_message(chat_id, f"❌ Failed to get initial latest video: {res.get('error')}")
             application.bot_data["video_monitoring"] = False
             return
+        last_video_id = res["video_id"]
+        await application.bot.send_message(chat_id, f"Current latest: {res.get('title', 'Unknown')} ({last_video_id})")
 
         while application.bot_data.get("video_monitoring", False):
             loop_start = time.time()
-            key = rotator.get_key()
-            if not key:
-                await asyncio.sleep(POLL_INTERVAL)
-                continue
-
-            res = await fetch_latest_video(session, key, YOUTUBE_CHANNEL_ID)
+            res = await fetch_latest_video_rss(session)
             if "video_id" in res and res["video_id"] != last_video_id:
                 await application.bot.send_message(chat_id, f"🆕 NEW VIDEO DETECTED!\n{res.get('title', 'Unknown')}")
                 await process_video(res["video_id"], chat_id, application)
@@ -317,16 +300,12 @@ async def start_monitor(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if context.application.bot_data.get("video_monitoring"):
         await update.message.reply_text("Already monitoring.")
         return
-
     context.application.bot_data["chat_id"] = update.effective_chat.id
-    context.application.bot_data["yt_api_keys"] = YT_API_KEYS
     context.application.bot_data["video_monitoring"] = True
-
     context.application.create_task(monitor_new_video(context.application))
-
     await update.message.reply_text(
         f"🚀 Auto monitoring started!\n"
-        f"Polling interval: {POLL_INTERVAL}s (configurable via POLL_INTERVAL env)\n"
+        f"Polling interval: {POLL_INTERVAL}s\n"
         f"DRY_RUN: {DRY_RUN}\n"
         f"Trade amount: ${TRADE_AMOUNT_USDC}"
     )
@@ -335,13 +314,11 @@ async def analyze_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
         await update.message.reply_text("Usage: /analyze <YouTube video URL or ID>")
         return
-
     video_input = " ".join(context.args)
     video_id = extract_video_id(video_input)
     if not video_id:
         await update.message.reply_text("❌ Invalid YouTube URL or video ID.")
         return
-
     chat_id = update.effective_chat.id
     await process_video(video_id, chat_id, context.application)
 
@@ -362,12 +339,10 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def main():
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
-
     app.add_handler(CommandHandler("start_monitor", start_monitor))
     app.add_handler(CommandHandler("analyze", analyze_video))
     app.add_handler(CommandHandler("stop", stop_monitor))
     app.add_handler(CommandHandler("status", status))
-
     print("MrBeast Trading Bot ready.\nCommands:\n/start_monitor - auto poll for new video\n/analyze <url/id> - manual analyze\n/stop - stop auto\n/status")
     app.run_polling()
 

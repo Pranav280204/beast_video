@@ -1,9 +1,17 @@
 import os
 import re
 import requests
-from flask import Flask, request, render_template_string
+import telebot
 
-app = Flask(__name__)
+# Get tokens from environment variables (set these in Railway)
+BOT_TOKEN = os.environ.get("BOT_TOKEN")
+API_TOKEN = os.environ.get("API_TOKEN")
+
+if not BOT_TOKEN:
+    print("ERROR: BOT_TOKEN not set in environment variables!")
+    exit(1)
+
+bot = telebot.TeleBot(BOT_TOKEN)
 
 # Robust video ID extraction
 def extract_video_id(user_input):
@@ -42,7 +50,7 @@ def extract_transcript_text(data):
     collect_text(data)
     return " ".join(text_parts)
 
-# Word/phrase groups (same as before)
+# Word/phrase groups
 word_groups = {
     "Dollar": r"\bdollar(s)?\b",
     "Thousand/Million": r"\b(thousand|million)(s)?\b",
@@ -63,117 +71,95 @@ word_groups = {
     "Subscribe": r"\bsubscrib(e|ed|ing|er|s)?\b"
 }
 
-# HTML template
-HTML = """
-<!doctype html>
-<html>
-<head>
-    <title>MrBeast Word Counter</title>
-    <style>
-        body { font-family: Arial, sans-serif; max-width: 900px; margin: 40px auto; padding: 20px; }
-        textarea { width: 100%; font-family: monospace; }
-        table { border-collapse: collapse; width: 100%; margin-top: 30px; }
-        th, td { border: 1px solid #ccc; padding: 10px; text-align: left; }
-        th { background: #f0f0f0; }
-        .error { color: red; font-weight: bold; }
-    </style>
-</head>
-<body>
-    <h1>MrBeast Word Counter</h1>
-    <form method="post">
-        <h3>Option 1: Auto-fetch Transcript (requires API_TOKEN in env)</h3>
-        <label>Enter YouTube Video URL or ID:</label><br>
-        <input type="text" name="video_input" size="70" placeholder="e.g. https://www.youtube.com/watch?v=ZFoNBxpXen4 or just ZFoNBxpXen4"><br><br>
-        
-        <h3>Option 2: Manual Transcript Paste</h3>
-        <label>Paste the full transcript here:</label><br>
-        <textarea name="manual_transcript" rows="15" placeholder="Paste transcript and submit..."></textarea><br><br>
-        
-        <input type="submit" value="Analyze Transcript">
-    </form>
+def format_results(text_lower):
+    counts = {}
+    for category, pattern in word_groups.items():
+        counts[category] = len(re.findall(pattern, text_lower))
     
-    {% if error %}
-        <p class="error">{{ error }}</p>
-    {% endif %}
+    sorted_counts = dict(sorted(counts.items()))
+    total = sum(sorted_counts.values())
     
-    {% if results %}
-        <h2>Word/Phrase Count Results</h2>
-        <table>
-            <tr><th>Category</th><th>Count</th></tr>
-            {% for category, count in results.items() %}
-                <tr><td>{{ category }}</td><td>{{ count }}</td></tr>
-            {% endfor %}
-            <tr><td><strong>TOTAL</strong></td><td><strong>{{ total }}</strong></td></tr>
-        </table>
-    {% endif %}
-</body>
-</html>
-"""
+    msg = "<pre>"
+    msg += f"{'Category':<30} {'Count':>8}\n"
+    msg += "-" * 40 + "\n"
+    for category, count in sorted_counts.items():
+        msg += f"{category:<30} {count:>8}\n"
+    msg += "-" * 40 + "\n"
+    msg += f"{'TOTAL':<30} {total:>8}\n"
+    msg += "</pre>"
+    
+    return f"<b>MrBeast Word Count Results</b>\n\n{msg}"
 
-@app.route("/", methods=["GET", "POST"])
-def index():
-    results = None
-    total = 0
-    error = None
+@bot.message_handler(commands=['start', 'help'])
+def send_welcome(message):
+    welcome_text = (
+        "<b>Welcome to the MrBeast Word Counter Bot! 👋</b>\n\n"
+        "Send me one of the following:\n"
+        "• A <b>YouTube video URL</b> (or just the video ID) → I'll auto-fetch the transcript and count the buzzwords (requires API_TOKEN configured).\n"
+        "• The <b>transcript text directly</b> (good for short transcripts).\n"
+        "• A <b>.txt file</b> containing the full transcript (best for long MrBeast videos).\n\n"
+        "The bot counts classic MrBeast words like Dollar, Challenge, Insane, Subscribe, etc."
+    )
+    bot.reply_to(message, welcome_text, parse_mode='HTML')
+
+@bot.message_handler(content_types=['text'])
+def handle_text(message):
+    user_text = message.text.strip()
+    if not user_text:
+        bot.reply_to(message, "Please send a YouTube URL, transcript text, or a .txt file.")
+        return
     
-    if request.method == "POST":
-        manual_transcript = request.form.get("manual_transcript", "").strip()
-        video_input = request.form.get("video_input", "").strip()
-        
-        text = ""
-        
-        # Prefer manual transcript if provided
-        if manual_transcript:
-            text = manual_transcript.lower()
-        elif video_input:
-            video_id = extract_video_id(video_input)
-            if not video_id:
-                error = "Could not extract a valid YouTube video ID. Check the URL/ID."
+    video_id = extract_video_id(user_text)
+    
+    if video_id and API_TOKEN:
+        bot.reply_to(message, "🔄 Fetching transcript from YouTube...")
+        try:
+            url = "https://www.youtube-transcript.io/api/transcripts"
+            headers = {
+                "Authorization": f"Basic {API_TOKEN}",
+                "Content-Type": "application/json"
+            }
+            payload = {"ids": [video_id]}
+            
+            response = requests.post(url, headers=headers, json=payload, timeout=30)
+            response.raise_for_status()
+            data = response.json()
+            
+            raw_text = extract_transcript_text(data)
+            if raw_text.strip():
+                result_msg = format_results(raw_text.lower())
+                bot.send_message(message.chat.id, result_msg, parse_mode='HTML')
+                return
             else:
-                api_token = os.environ.get("API_TOKEN")
-                if not api_token:
-                    error = "API_TOKEN is not set in environment variables. Use manual mode instead."
-                else:
-                    url = "https://www.youtube-transcript.io/api/transcripts"
-                    headers = {
-                        "Authorization": f"Basic {api_token}",
-                        "Content-Type": "application/json"
-                    }
-                    payload = {"ids": [video_id]}
-                    
-                    try:
-                        response = requests.post(url, headers=headers, json=payload, timeout=30)
-                        response.raise_for_status()
-                        data = response.json()
-                        
-                        raw_text = extract_transcript_text(data)
-                        if raw_text.strip():
-                            text = raw_text.lower()
-                        else:
-                            error = "Transcript fetched but no text found (possibly no captions available)."
-                    except requests.exceptions.HTTPError as http_err:
-                        status = response.status_code
-                        if status == 429:
-                            error = "Rate limited (429). Wait and try again later."
-                        elif status == 400:
-                            error = "Bad request (400) – check your API token or video ID."
-                        else:
-                            error = f"API error: {http_err} (status {status})"
-                    except Exception as e:
-                        error = f"Error fetching transcript: {str(e)}"
-        else:
-            error = "Please provide either a video URL/ID or paste a transcript."
-        
-        # If we have text, count the words
-        if text and not error:
-            counts = {}
-            for category, pattern in word_groups.items():
-                counts[category] = len(re.findall(pattern, text))
-            results = dict(sorted(counts.items()))
-            total = sum(results.values())
-    
-    return render_template_string(HTML, results=results, total=total, error=error)
+                bot.reply_to(message, "No transcript found (video may not have captions). Please paste it manually or send as .txt file.")
+                return
+        except Exception as e:
+            bot.reply_to(message, f"❌ Fetch failed: {str(e)[:200]}\nPlease paste the transcript manually or send as .txt file.")
+            return
+    else:
+        # Treat as manual transcript text
+        if not API_TOKEN and video_id:
+            bot.reply_to(message, "API_TOKEN not configured → can't auto-fetch. Treating your message as manual transcript.")
+        result_msg = format_results(user_text.lower())
+        bot.send_message(message.chat.id, result_msg, parse_mode='HTML')
 
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port)
+@bot.message_handler(content_types=['document'])
+def handle_document(message):
+    doc = message.document
+    if doc.mime_type != 'text/plain' and not doc.file_name.lower().endswith('.txt'):
+        bot.reply_to(message, "Please send a plain text (.txt) file for the transcript.")
+        return
+    
+    bot.reply_to(message, "📄 Processing your transcript file...")
+    try:
+        file_info = bot.get_file(doc.file_id)
+        downloaded = bot.download_file(file_info.file_path)
+        transcript = downloaded.decode('utf-8', errors='replace')
+        
+        result_msg = format_results(transcript.lower())
+        bot.send_message(message.chat.id, result_msg, parse_mode='HTML')
+    except Exception as e:
+        bot.reply_to(message, f"❌ Error processing file: {str(e)}")
+
+print("Bot is running...")
+bot.infinity_polling()

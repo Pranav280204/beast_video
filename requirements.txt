@@ -1,2 +1,4 @@
-pyTelegramBotAPI
-requests
+pyTelegramBotAPI==4.23.0
+requests==2.32.3
+ecdsa==0.19.0
+py-clob-client==1.6.1

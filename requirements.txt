@@ -1,7 +1,2 @@
-# requirements.txt
-python-telegram-bot==20.8
-aiohttp
+pyTelegramBotAPI
 requests
-python-dotenv
-web3
-py-clob-client

@@ -27,19 +27,14 @@ load_dotenv()
 PRIVATE_KEY = os.getenv("PRIVATE_KEY")
 WALLET_ADDRESS = os.getenv("WALLET_ADDRESS")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+YT_TRANSCRIPT_TOKEN = os.getenv("YT_TRANSCRIPT_TOKEN")  # for youtube-transcript.io
+MRBEAST_TRADE_AMOUNT = float(os.getenv("MRBEAST_TRADE_AMOUNT", "5.0"))  # USDC per qualifying Yes trade (0 to disable)
 DRY_RUN = os.getenv("DRY_RUN", "True").lower() == "true"
 GAMMA_API = os.getenv("GAMMA_API", "https://gamma-api.polymarket.com")
 CLOB_API = os.getenv("CLOB_API", "https://clob.polymarket.com")
 POLYGON_RPC = os.getenv("POLYGON_RPC", "https://polygon-rpc.com/")
 CONDITIONAL_TOKENS = os.getenv("CONDITIONAL_TOKENS", "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045")
-
-# YouTube transcript fetch
-YT_TRANSCRIPT_API_TOKEN = os.getenv("YT_TRANSCRIPT_API_TOKEN")  # youtube-transcript.io token
-
-# Auto-trade config for MrBeast video resolution
-MRBEAST_EVENT_SLUG = "what-will-mrbeast-say-during-his-next-youtube-video"
-AUTO_BUY_USDC_PER_MARKET = float(os.getenv("AUTO_BUY_USDC_PER_MARKET", "0"))  # 0 = disabled
-AUTO_MAX_YES_PRICE = float(os.getenv("AUTO_MAX_YES_PRICE", "0.95"))  # only buy if mid price < this
+MRBEAST_EVENT_SLUG = "what-will-mrbeast-say-during-his-next-youtube-video"  # fixed event
 
 # YouTube monitoring (existing)
 YT_API_KEYS = [k.strip() for k in os.getenv("YOUTUBE_API_KEYS", "").split(",") if k.strip()]
@@ -48,20 +43,29 @@ POLL_INTERVAL = float(os.getenv("YT_POLL_INTERVAL", "60"))
 TELEGRAM_HEARTBEAT = float(os.getenv("YT_HEARTBEAT", "10"))
 
 if not TELEGRAM_BOT_TOKEN:
-    raise ValueError("Missing TELEGRAM_BOT_TOKEN")
+    raise ValueError("Missing TELEGRAM_BOT_TOKEN in environment")
 
-# ---------- Web3 + Clob ----------
+# ---------- Web3 + ClobClient ----------
 w3 = Web3(Web3.HTTPProvider(POLYGON_RPC))
 client = None
 if PRIVATE_KEY and WALLET_ADDRESS:
     try:
-        client = ClobClient(host=CLOB_API, key=PRIVATE_KEY, chain_id=137, signature_type=1, funder=WALLET_ADDRESS)
+        client = ClobClient(
+            host=CLOB_API,
+            key=PRIVATE_KEY,
+            chain_id=137,
+            signature_type=1,
+            funder=WALLET_ADDRESS
+        )
         creds = client.create_or_derive_api_creds()
         client.set_api_creds(creds)
+        print("ClobClient initialized")
     except Exception as e:
-        print("ClobClient init error:", e)
+        print("ClobClient init failed:", e)
 
-# ---------- Word groups for MrBeast buzzwords ----------
+ERC1155_ABI = [...]  # (keep your existing ABI)
+
+# ---------- Word groups for MrBeast transcript counting ----------
 word_groups = {
     "Dollar": r"\bdollar(s)?\b",
     "Thousand/Million": r"\b(thousand|million)(s)?\b",
@@ -82,33 +86,9 @@ word_groups = {
     "Subscribe": r"\bsubscrib(e|ed|ing|er|s)?\b"
 }
 
-# Mapping from market question keywords → (category, threshold)
-MARKET_MAPPING = {
-    "dollar": ("Dollar", 10),
-    "thousand": ("Thousand/Million", 10),
-    "million": ("Thousand/Million", 10),
-    "challenge": ("Challenge", 1),
-    "eliminated": ("Eliminated", 1),
-    "trap": ("Trap", 1),
-    "car": ("Car/Supercar", 1),
-    "supercar": ("Car/Supercar", 1),
-    "tesla": ("Tesla/Lamborghini", 1),
-    "lamborghini": ("Tesla/Lamborghini", 1),
-    "helicopter": ("helicopter/Jet", 1),
-    "jet": ("helicopter/Jet", 1),
-    "island": ("Island", 1),
-    "mystery box": ("Mystery Box", 1),
-    "massive": ("Massive", 1),
-    "world's biggest": ("World's Biggest/Worlds Largest", 1),
-    "world's largest": ("World's Biggest/Worlds Largest", 1),
-    "beast games": ("Beast Games", 1),
-    "feastables": ("Feastables", 1),
-    "mrbeast": ("MrBeast", 1),
-    "insane": ("Insane", 1),
-    "subscribe": ("Subscribe", 1),
-}
-
 # ---------- Helpers (existing + new) ----------
+# (keep your existing helpers: fetch_active_markets, normalize_outcomes_and_token_ids, get_mid_price, get_balance_shares, place_market_order)
+
 def extract_video_id(user_input: str):
     patterns = [
         r'(?:v=|\/embed\/|\/shorts\/|\/watch\?v=|youtu\.be\/)([0-9A-Za-z_-]{11})',
@@ -133,6 +113,7 @@ def extract_transcript_text(data):
                     for item in v:
                         if isinstance(item, dict) and 'text' in item:
                             text_parts.append(item['text'])
+                        collect(item)
                 collect(v)
         elif isinstance(obj, list):
             for item in obj:
@@ -140,124 +121,153 @@ def extract_transcript_text(data):
     collect(data)
     return " ".join(text_parts)
 
-# ... (keep your existing helpers: fetch_active_markets, normalize_outcomes_and_token_ids, get_mid_price, get_balance_shares, place_market_order)
+def count_words(text_lower: str):
+    counts = {}
+    for category, pattern in word_groups.items():
+        counts[category] = len(re.findall(pattern, text_lower))
+    return counts
 
-# ---------- New: YouTube video handler for auto analysis + trade ----------
-async def handle_youtube_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip()
-    video_id = extract_video_id(text)
+def format_count_table(counts: dict):
+    sorted_counts = dict(sorted(counts.items()))
+    total = sum(sorted_counts.values())
+    lines = [
+        "<b>MrBeast Word Counts</b>",
+        "<pre>",
+        f"{'Category':<30} {'Count':>8}",
+        "-" * 40,
+    ]
+    for cat, cnt in sorted_counts.items():
+        lines.append(f"{cat:<30} {cnt:>8}")
+    lines.extend(["-" * 40, f"{'TOTAL':<30} {total:>8}", "</pre>"])
+    return "\n".join(lines)
+
+def get_category_and_threshold(market: dict):
+    q = market.get("question", "").lower()
+    if "dollar" in q and "10" in q:
+        return "Dollar", 10
+    if ("thousand" in q or "million" in q) and "10" in q:
+        return "Thousand/Million", 10
+    if "challenge" in q:
+        return "Challenge", 1
+    if "eliminated" in q:
+        return "Eliminated", 1
+    if "trap" in q:
+        return "Trap", 1
+    if "car" in q or "supercar" in q:
+        return "Car/Supercar", 1
+    if "tesla" in q or "lamborghini" in q:
+        return "Tesla/Lamborghini", 1
+    if "helicopter" in q or "jet" in q:
+        return "helicopter/Jet", 1
+    if "island" in q:
+        return "Island", 1
+    if "mystery box" in q:
+        return "Mystery Box", 1
+    if "massive" in q:
+        return "Massive", 1
+    if "world's biggest" in q or "worlds largest" in q:
+        return "World's Biggest/Worlds Largest", 1
+    if "beast games" in q:
+        return "Beast Games", 1
+    if "feastables" in q:
+        return "Feastables", 1
+    if "mrbeast" in q or "mr.beast" in q:
+        return "MrBeast", 1
+    if "insane" in q:
+        return "Insane", 1
+    if "subscribe" in q:
+        return "Subscribe", 1
+    return None, None
+
+# ---------- New: YouTube link handler ----------
+async def handle_youtube_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    video_id = extract_video_id(update.message.text)
     if not video_id:
-        return  # not a YouTube link/ID
-
-    if not YT_TRANSCRIPT_API_TOKEN:
-        await update.message.reply_text("YT_TRANSCRIPT_API_TOKEN not configured – cannot auto-fetch transcript.")
+        await update.message.reply_text("Couldn't extract video ID. Send a valid YouTube link.")
         return
 
-    await update.message.reply_text("🎥 YouTube video detected! Fetching transcript for MrBeast word analysis...")
+    await update.message.reply_text(f"🔗 Detected MrBeast video: {video_id}\nFetching transcript...")
 
-    loop = asyncio.get_running_loop()
+    if not YT_TRANSCRIPT_TOKEN:
+        await update.message.reply_text("No YT_TRANSCRIPT_TOKEN set – can't auto-fetch. Paste transcript manually.")
+        return
+
     try:
-        response = await loop.run_in_executor(None, lambda: requests.post(
-            "https://www.youtube-transcript.io/api/transcripts",
-            headers={"Authorization": f"Basic {YT_TRANSCRIPT_API_TOKEN}", "Content-Type": "application/json"},
-            json={"ids": [video_id]},
-            timeout=30
-        ))
+        url = "https://www.youtube-transcript.io/api/transcripts"
+        headers = {"Authorization": f"Basic {YT_TRANSCRIPT_TOKEN}", "Content-Type": "application/json"}
+        payload = {"ids": [video_id]}
+        response = requests.post(url, headers=headers, json=payload, timeout=30)
         response.raise_for_status()
         data = response.json()
         transcript = extract_transcript_text(data).lower()
-
         if not transcript.strip():
-            await update.message.reply_text("Transcript fetched but empty (no captions?).")
+            await update.message.reply_text("Transcript fetched but empty (no captions?). Paste manually.")
             return
-
-        # Count words
-        counts = {cat: len(re.findall(pat, transcript)) for cat, pat in word_groups.items()}
-        sorted_counts = dict(sorted(counts.items()))
-        total = sum(sorted_counts.values())
-
-        table = "<pre>"
-        table += f"{'Category':<30} {'Count':>8}\n"
-        table += "-" * 40 + "\n"
-        for cat, cnt in sorted_counts.items():
-            table += f"{cat:<30} {cnt:>8}\n"
-        table += "-" * 40 + "\n"
-        table += f"{'TOTAL':<30} {total:>8}\n"
-        table += "</pre>"
-
-        await update.message.reply_text(f"<b>MrBeast Buzzword Counts</b>\n\n{table}", parse_mode="HTML")
-
-        # Auto-trade if enabled
-        if AUTO_BUY_USDC_PER_MARKET <= 0:
-            await update.message.reply_text("Auto-trading disabled (set AUTO_BUY_USDC_PER_MARKET > 0).")
-            return
-
-        await update.message.reply_text("Checking markets for auto-trades...")
-
-        markets = await loop.run_in_executor(None, fetch_active_markets, MRBEAST_EVENT_SLUG)
-        if not markets:
-            await update.message.reply_text("No active markets found for the MrBeast event.")
-            return
-
-        trade_log = []
-        for market in markets:
-            q_lower = market.get("question", "").lower()
-            outcomes, token_ids = normalize_outcomes_and_token_ids(market)
-            if len(outcomes) < 2 or not token_ids:
-                continue
-
-            yes_idx = next((i for i, o in enumerate(outcomes) if o.lower() == "yes"), None)
-            if yes_idx is None:
-                continue
-            yes_token = token_ids[yes_idx]
-
-            mid = await loop.run_in_executor(None, get_mid_price, yes_token)
-            if mid is None or mid >= AUTO_MAX_YES_PRICE:
-                continue
-
-            # Match category & threshold
-            matched = None
-            for key, (cat, thresh) in MARKET_MAPPING.items():
-                if key in q_lower:
-                    matched = (cat, thresh)
-                    break
-            if not matched:
-                continue
-
-            cat, thresh = matched
-            count = counts.get(cat, 0)
-            if count < thresh:
-                continue  # NO
-
-            # YES → auto buy
-            resp = await asyncio.to_thread(place_market_order, yes_token, AUTO_BUY_USDC_PER_MARKET, BUY)
-            status = "DRY RUN" if DRY_RUN else "EXECUTED"
-            trade_log.append(f"✅ {status} Buy ${AUTO_BUY_USDC_PER_MARKET} YES on \"{cat}\" (count: {count}, ~{mid:.2f}¢)")
-
-        if trade_log:
-            await update.message.reply_text("<b>Auto Trades Executed:</b>\n" + "\n".join(trade_log), parse_mode="HTML")
-        else:
-            await update.message.reply_text("No auto-trades triggered (priced in or below threshold).")
-
     except Exception as e:
-        await update.message.reply_text(f"Error during analysis/trading: {str(e)}")
+        await update.message.reply_text(f"Transcript fetch failed: {str(e)[:200]}\nPaste manually if needed.")
+        return
 
-# ... (keep your existing handlers: monitor_youtube_and_trigger, check_latest_subs, conversation handlers, etc.)
+    await update.message.reply_text("Transcript fetched! Counting words...")
+
+    counts = count_words(transcript)
+    await update.message.reply_text(format_count_table(counts), parse_mode="HTML")
+
+    await update.message.reply_text("Checking Polymarket markets for auto-trades...")
+
+    markets = fetch_active_markets(MRBEAST_EVENT_SLUG)
+    if not markets:
+        await update.message.reply_text("No active markets found for the MrBeast event.")
+        return
+
+    trade_log = []
+    amount = MRBEAST_TRADE_AMOUNT
+
+    for market in markets:
+        cat, thresh = get_category_and_threshold(market)
+        if not cat:
+            continue
+        count = counts.get(cat, 0)
+        if count < thresh:
+            continue
+
+        outcomes, token_ids = normalize_outcomes_and_token_ids(market)
+        yes_idx = next((i for i, o in enumerate(outcomes) if isinstance(o, str) and "yes" in o.lower()), None)
+        if yes_idx is None or not token_ids:
+            continue
+
+        token_yes = token_ids[yes_idx]
+        mid = get_mid_price(token_yes)
+        price_str = f"{mid:.4f}" if mid else "N/A"
+
+        if amount <= 0:
+            trade_log.append(f"✅ {cat} qualifies (count {count} >= {thresh}, ~{price_str}) – trade disabled (amount=0)")
+            continue
+
+        resp = await asyncio.to_thread(place_market_order, token_yes, amount, BUY)
+        status = resp.get("status", "error") if isinstance(resp, dict) else "error"
+        trade_log.append(f"✅ {cat} Yes (count {count} >= {thresh}, ~{price_str}) → Bought ${amount} | {status}")
+
+    if trade_log:
+        await update.message.reply_text("<b>Auto-Trades Executed</b>\n\n" + "\n".join(trade_log), parse_mode="HTML")
+    else:
+        await update.message.reply_text("No qualifying markets for auto-trade.")
+
+# ---------- Rest of your existing code (monitoring, conversation, etc.) ----------
+# (keep everything else unchanged)
 
 def main():
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 
-    # Priority: YouTube links first
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_youtube_video), group=0)
+    # Existing handlers
+    # ... (your conv handler, stop, status, check_latest_subs, etc.)
 
-    # Existing conversation, commands, etc.
-    # ... add your conv handler, stop, status, subs, etc.
+    # New: YouTube link handler (high priority – non-command text with youtube link)
+    app.add_handler(MessageHandler(filters.Regex(r'(https?://)?(www\.)?(youtube|youtu)\.(com|be)'), handle_youtube_link))
 
-    app.bot_data["yt_api_keys"] = YT_API_KEYS
-    app.bot_data["YOUTUBE_CHANNEL_ID"] = YOUTUBE_CHANNEL_ID
+    # (keep your existing app.bot_data setup)
 
-    print("MrBeast Polymarket Bot started – send a YouTube link to auto-analyze & trade!")
-    app.run_polling()
+    print("Bot running – send a MrBeast YouTube link for auto transcript + trade!")
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
     main()

@@ -5,18 +5,19 @@ import telebot
 import hashlib
 from ecdsa import SigningKey, SECP256k1
 
-# Polymarket trading imports (only if AUTO_TRADE enabled)
+# Polymarket trading imports
 if os.environ.get("AUTO_TRADE", "false").lower() == "true":
     from py_clob_client.client import ClobClient
-    from py_clob_client.clob_types import OrderArgs
+    from py_clob_client.clob_types import MarketOrderArgs, OrderType
 
 # Environment variables
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 API_TOKEN = os.environ.get("API_TOKEN")
-PRIVATE_KEY = os.environ.get("PRIVATE_KEY")  # Revealed magic key with or without 0x
-WALLET_ADDRESS = os.environ.get("WALLET_ADDRESS")  # Optional: set manually
+PRIVATE_KEY = os.environ.get("PRIVATE_KEY")  # Revealed magic key, with or without 0x
+WALLET_ADDRESS = os.environ.get("WALLET_ADDRESS")  # Optional, auto-derived if missing
+MARKET_SLUG = os.environ.get("MARKET_SLUG", "what-will-mrbeast-say-during-his-next-youtube-video")
 AUTO_TRADE = os.environ.get("AUTO_TRADE", "false").lower() == "true"
-TRADE_AMOUNT = float(os.environ.get("TRADE_AMOUNT", "20"))  # USD amount to spend per opportunity
+TRADE_AMOUNT = float(os.environ.get("TRADE_AMOUNT", "20"))  # USD per opportunity
 
 if not BOT_TOKEN:
     print("ERROR: BOT_TOKEN not set!")
@@ -24,15 +25,15 @@ if not BOT_TOKEN:
 
 bot = telebot.TeleBot(BOT_TOKEN)
 
-# Derive address if not set in env
+# Derive wallet address from private key if not provided
 def derive_address(private_key: str) -> str:
-    pk = private_key[2:] if private_key.startswith('0x') else private_key
+    pk = private_key[2:] if private_key.startswith("0x") else private_key
     priv_key_bytes = bytes.fromhex(pk)
     sk = SigningKey.from_string(priv_key_bytes, curve=SECP256k1)
     vk = sk.verifying_key
-    uncompressed_pub_key = b'\x04' + vk.to_string()
-    keccak = hashlib.sha3_256(uncompressed_pub_key).digest()
-    return '0x' + keccak[-20:].hex()
+    uncompressed_pub = b'\x04' + vk.to_string()
+    keccak = hashlib.sha3_256(uncompressed_pub).digest()
+    return "0x" + keccak[-20:].hex()
 
 if PRIVATE_KEY and not WALLET_ADDRESS:
     WALLET_ADDRESS = derive_address(PRIVATE_KEY)
@@ -56,8 +57,8 @@ def extract_transcript_text(data):
         if isinstance(obj, str):
             text_parts.append(obj)
         elif isinstance(obj, dict):
-            if 'text' in obj and isinstance(obj['text'], str):
-                text_parts.append(obj['text'])
+            if "text" in obj and isinstance(obj["text"], str):
+                text_parts.append(obj["text"])
             else:
                 for v in obj.values():
                     collect(v)
@@ -67,7 +68,7 @@ def extract_transcript_text(data):
     collect(data)
     return " ".join(text_parts)
 
-# Current word groups (updated to match active Feb 2026 markets)
+# Word groups (exact match for current Feb 2026 markets)
 word_groups = {
     "Dollar": r"\bdollar(s)?\b",
     "Thousand/Million": r"\b(thousand|million|billion)(s)?\b",
@@ -88,9 +89,10 @@ word_groups = {
     "Subscribe": r"\bsubscrib(e|ed|ing|er|s)?\b"
 }
 
+# Keywords to match market questions (case-insensitive)
 polymarket_keywords = {
     "Dollar": "dollar",
-    "Thousand/Million": "thousand|million",
+    "Thousand/Million": "thousand|million|billion",
     "Challenge": "challenge",
     "Eliminated": "eliminated",
     "Trap": "trap",
@@ -103,61 +105,71 @@ polymarket_keywords = {
     "World's Biggest/Largest": "world.?s (biggest|largest)",
     "Beast Games": "beast games",
     "Feastables": "feastables",
-    "MrBeast": "mrbeast|mr.?beast",
+    "MrBeast": "mrbeast|mr\.?beast",
     "Insane": "insane",
     "Subscribe": "subscribe"
 }
 
-# Fetch Polymarket data + dynamic thresholds
+# Fixed thresholds (as requested — no dynamic parsing)
+thresholds = {
+    "Dollar": 10,
+    "Thousand/Million": 10,
+    **{cat: 1 for cat in word_groups if cat not in ["Dollar", "Thousand/Million"]}
+}
+
+# Fetch Polymarket data using slug (fixes "no active market" error)
 def get_polymarket_data():
+    if not MARKET_SLUG:
+        print("MARKET_SLUG not set")
+        return None, None
+
     try:
-        url = "https://gamma-api.polymarket.com/events?active=true"
+        url = f"https://gamma-api.polymarket.com/events/slug/{MARKET_SLUG}"
         response = requests.get(url, timeout=15)
         response.raise_for_status()
-        events = response.json()
+        data = response.json()
 
-        target_event = None
-        for event in events:
-            title_lower = event.get("title", "").lower()
-            if "mrbeast" in title_lower and "next" in title_lower and "youtube" in title_lower:
-                target_event = event
-                break
+        # API sometimes wraps in {"event": {...}}, handle both
+        event = data.get("event", data)
+        markets = event.get("markets", [])
 
-        if not target_event:
-            return None, None, None
-
-        markets = target_event.get("markets", [])
         prices = {}
         token_ids = {}
-        dyn_thresholds = {cat: 1 for cat in word_groups}  # default 1+
 
         for market in markets:
-            q_lower = market.get("question", "").lower()
+            if not market.get("active"):
+                continue
+
+            question_lower = market["question"].lower()
             matched_cat = None
+
             for cat, keyword in polymarket_keywords.items():
-                if re.search(keyword, q_lower):
+                if re.search(keyword, question_lower):
                     matched_cat = cat
-                    # Extract threshold like "10+ times"
-                    thresh_match = re.search(r'(\d+)\+?\s*times', q_lower)
-                    if thresh_match:
-                        dyn_thresholds[cat] = int(thresh_match.group(1))
                     break
 
             if matched_cat:
-                outcome_prices = market.get("outcome_prices", [])
-                if len(outcome_prices) >= 2:
-                    yes_price = float(outcome_prices[0])
+                outcome_prices = market.get("outcomePrices") or market.get("outcome_prices", [])
+                if outcome_prices and len(outcome_prices) >= 2:
+                    yes_price = float(outcome_prices[0])  # Yes is always first
                     prices[matched_cat] = yes_price
-                    for token in market.get("tokens", []):
-                        if token.get("outcome", "").lower() == "yes":
-                            token_ids[matched_cat] = token.get("token_id")
-                            break
 
-        return prices, token_ids, dyn_thresholds
+                # Prefer tokens array, fallback to clobTokenIds
+                yes_token = None
+                for token in market.get("tokens", []):
+                    if token.get("outcome", "").lower() == "yes":
+                        yes_token = token["token_id"]
+                        break
+                if yes_token:
+                    token_ids[matched_cat] = yes_token
+                elif "clobTokenIds" in market and market["clobTokenIds"]:
+                    token_ids[matched_cat] = market["clobTokenIds"][0]  # Yes first
+
+        return prices, token_ids
 
     except Exception as e:
-        print(f"Polymarket error: {e}")
-        return None, None, None
+        print(f"Polymarket fetch error: {e}")
+        return None, None
 
 def format_results(text_lower):
     counts = {cat: len(re.findall(pattern, text_lower)) for cat, pattern in word_groups.items()}
@@ -175,18 +187,18 @@ def format_results(text_lower):
     msg += "</pre>"
 
     # Polymarket section
-    prices, token_ids, dyn_thresholds = get_polymarket_data()
+    prices, token_ids = get_polymarket_data()
     poly_section = ""
     opportunities = []
     trade_section = ""
 
     if prices:
-        poly_section += "\n<b>📈 Polymarket MrBeast Markets (Feb 2026)</b>\n<pre>"
+        poly_section += "\n<b>📈 Polymarket MrBeast Markets (Live Yes Prices)</b>\n<pre>"
         poly_section += f"{'Category':<30} {'Count':>6} {'≥Thresh':>9} {'Yes ¢':>8} {'Status':>20}\n"
         poly_section += "-" * 80 + "\n"
 
         for cat, count in sorted_counts.items():
-            thresh = dyn_thresholds.get(cat, 1)
+            thresh = thresholds.get(cat, 1)
             yes_p = prices.get(cat)
             status = ""
             if count >= thresh and yes_p is not None and yes_p < 0.95:
@@ -199,47 +211,41 @@ def format_results(text_lower):
 
         poly_section += "-" * 80 + "\n"
         if opportunities:
-            poly_section += f"\n<b>🚨 {len(opportunities)} OPPORTUNITIES!</b>"
+            poly_section += f"\n<b>🚨 {len(opportunities)} OPPORTUNITIES DETECTED!</b>"
         else:
-            poly_section += "\nNo strong edges."
+            poly_section += "\nNo strong edges right now."
         poly_section += "</pre>"
     else:
-        poly_section += "\n<i>⚠️ No active market or API issue.</i>"
+        poly_section += "\n<i>⚠️ No active market found / API issue / wrong slug. Set MARKET_SLUG env var correctly.</i>"
 
-    # Auto-trading
+    # Auto-trading (market orders for fast fill)
     if AUTO_TRADE and PRIVATE_KEY and opportunities and prices:
         try:
-            pk_for_client = PRIVATE_KEY[2:] if PRIVATE_KEY.startswith('0x') else PRIVATE_KEY
-            client = ClobClient(
-                host="https://clob.polymarket.com",
-                chain_id=137,
-                key=pk_for_client
-            )
-            api_creds = client.create_or_derive_api_creds()
-            client.api_key = api_creds["api_key"]
-            client.api_secret = api_creds["api_secret"]
-            client.api_passphrase = api_creds["api_passphrase"]
+            pk = PRIVATE_KEY[2:] if PRIVATE_KEY.startswith("0x") else PRIVATE_KEY
+            client = ClobClient(host="https://clob.polymarket.com", key=pk, chain_id=137)
+            creds = client.create_or_derive_api_creds()
+            client.api_key = creds["api_key"]
+            client.api_secret = creds["api_secret"]
+            client.api_passphrase = creds["api_passphrase"]
 
-            address = client.get_address()
+            address = client.get_address() or WALLET_ADDRESS or "unknown"
             trade_section += f"\n<b>🤖 Auto-trading from {address[:8]}... (${TRADE_AMOUNT} per opp)</b>"
 
             for cat, token_id, yes_p in opportunities:
                 if not token_id:
+                    trade_section += f"\n⚠️ {cat}: No token_id"
                     continue
-                max_price = min(0.99, yes_p + 0.10)
-                size = TRADE_AMOUNT / max_price
 
-                order_args = OrderArgs(
+                mo = MarketOrderArgs(
                     token_id=token_id,
-                    price=max_price,
-                    size=round(size, 6),
-                    side="BUY"
+                    amount=TRADE_AMOUNT,
+                    side="BUY",
+                    order_type=OrderType.FOK
                 )
                 try:
-                    order = client.create_order(order_args)
-                    signed = client.sign_order(order)
-                    resp = client.post_order(signed)
-                    if resp.get("order_id") or resp.get("status") == "SUCCESS":
+                    signed = client.create_market_order(mo)
+                    resp = client.post_order(signed, OrderType.FOK)
+                    if resp.get("status") == "SUCCESS" or resp.get("order_id"):
                         trade_section += f"\n✅ Bought {cat} Yes (~${TRADE_AMOUNT})"
                     else:
                         trade_section += f"\n⚠️ {cat}: {resp.get('message', 'Failed')}"
@@ -256,15 +262,15 @@ def send_welcome(message):
         "<b>MrBeast Word Counter + Polymarket Sniper Bot! 👋</b>\n\n"
         "Send YouTube URL/ID, transcript text, or .txt file.\n\n"
         "Features:\n"
-        "• Auto-transcript fetch\n"
-        "• Buzzword counts\n"
-        "• Live Polymarket odds + dynamic thresholds (Dollar/Thousand 10+, others 1+)\n"
-        "• Auto-snipe underpriced Yes shares (${os.environ.get('TRADE_AMOUNT', '20')} per opportunity if AUTO_TRADE=true)\n\n"
-        f"Wallet: {WALLET_ADDRESS or 'Not set'}"
+        "• Auto-transcript + buzzword counts\n"
+        "• Live Polymarket odds for current MrBeast event\n"
+        "• Fixed thresholds: Dollar & Thousand/Million ≥10, others ≥1\n"
+        f"• Current slug: {MARKET_SLUG}\n"
+        f"• Auto-snipe Yes shares (${TRADE_AMOUNT} each if AUTO_TRADE=true)\n\n"
+        f"Wallet: {WALLET_ADDRESS or 'Not configured'}"
     )
     bot.reply_to(message, welcome_text, parse_mode='HTML')
 
-# Handlers unchanged (text + document)
 @bot.message_handler(content_types=['text'])
 def handle_text(message):
     user_text = message.text.strip()
@@ -283,7 +289,7 @@ def handle_text(message):
             response.raise_for_status()
             raw_text = extract_transcript_text(response.json())
             if not raw_text.strip():
-                bot.reply_to(message, "No transcript. Paste manually.")
+                bot.reply_to(message, "No transcript found. Paste manually.")
                 return
         except Exception as e:
             bot.reply_to(message, f"❌ Fetch error: {str(e)[:200]}")
@@ -298,10 +304,10 @@ def handle_text(message):
 def handle_document(message):
     doc = message.document
     if not (doc.mime_type == 'text/plain' or doc.file_name.lower().endswith('.txt')):
-        bot.reply_to(message, "Send .txt file only.")
+        bot.reply_to(message, "Send a plain .txt file only.")
         return
 
-    bot.reply_to(message, "📄 Processing...")
+    bot.reply_to(message, "📄 Processing file...")
     try:
         file_info = bot.get_file(doc.file_id)
         downloaded = bot.download_file(file_info.file_path)
@@ -309,7 +315,7 @@ def handle_document(message):
         result_msg = format_results(transcript.lower())
         bot.send_message(message.chat.id, result_msg, parse_mode='HTML')
     except Exception as e:
-        bot.reply_to(message, f"❌ Error: {str(e)}")
+        bot.reply_to(message, f"❌ File error: {str(e)}")
 
 print("Bot running...")
 bot.infinity_polling()

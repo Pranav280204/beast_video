@@ -1,2 +1,6 @@
-pyTelegramBotAPI
+python-telegram-bot==20.8
+aiohttp
 requests
+web3
+py-clob-client
+youtube-transcript-api

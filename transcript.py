@@ -81,7 +81,7 @@ word_groups = {
     "Eliminated": r"\beliminated?\b",
     "Trap": r"\btrap(s)?\b",
     "Car/Supercar": r"\b(car|supercar)(s)?\b",
-    "Tesla/Lamborghini":Dynamics r"\b(tesla|lamborghini)(s)?\b",
+    "Tesla/Lamborghini": r"\b(tesla|lamborghini)(s)?\b",
     "Helicopter/Jet": r"\b(helicopter|jet)(s)?\b",
     "Island": r"\bisland(s)?\b",
     "Mystery Box": r"\bmystery\s+box(es)?\b",

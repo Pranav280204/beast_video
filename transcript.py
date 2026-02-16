@@ -346,14 +346,16 @@ def format_results(text_lower):
             
             for cat, token_id, yes_p in opportunities:
                 try:
-                    # Try GTC order
-                    limit_price = min(yes_p * 1.02, 0.99)
-                    shares = actual_trade_amt / limit_price
+                    # Calculate order parameters
+                    # For $1 trade at 50¢: we want exactly 2 shares
+                    # Use current price for size calculation, add slippage to limit price
+                    shares = actual_trade_amt / yes_p  # Exact shares for desired USD amount
+                    limit_price = min(yes_p * 1.02, 0.99)  # Allow 2% slippage for fill
                     
                     args = OrderArgs(
                         token_id=token_id,
-                        price=limit_price,
-                        size=shares,
+                        price=limit_price,  # Max price we'll pay per share
+                        size=shares,  # Number of shares (based on current price)
                         side=BUY,
                     )
                     signed = client.create_order(args)

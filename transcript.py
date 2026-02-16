@@ -15,7 +15,6 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN")
 API_TOKEN = os.environ.get("API_TOKEN")
 PRIVATE_KEY = os.environ.get("PRIVATE_KEY")  # Revealed magic key, with or without 0x
 WALLET_ADDRESS = os.environ.get("WALLET_ADDRESS")  # Optional, auto-derived if missing
-MARKET_SLUG = os.environ.get("MARKET_SLUG", "what-will-mrbeast-say-during-his-next-youtube-video")
 AUTO_TRADE = os.environ.get("AUTO_TRADE", "false").lower() == "true"
 TRADE_AMOUNT = float(os.environ.get("TRADE_AMOUNT", "20"))  # USD per opportunity
 
@@ -25,7 +24,11 @@ if not BOT_TOKEN:
 
 bot = telebot.TeleBot(BOT_TOKEN)
 
-# Derive wallet address from private key if not provided
+# Per-chat storage
+slug_per_chat = {}  # chat_id -> slug
+waiting_for_slug = set()  # chats currently waiting for slug input
+
+# Derive wallet address
 def derive_address(private_key: str) -> str:
     pk = private_key[2:] if private_key.startswith("0x") else private_key
     priv_key_bytes = bytes.fromhex(pk)
@@ -68,7 +71,7 @@ def extract_transcript_text(data):
     collect(data)
     return " ".join(text_parts)
 
-# Word groups (exact match for current Feb 2026 markets)
+# Word groups
 word_groups = {
     "Dollar": r"\bdollar(s)?\b",
     "Thousand/Million": r"\b(thousand|million|billion)(s)?\b",
@@ -89,7 +92,6 @@ word_groups = {
     "Subscribe": r"\bsubscrib(e|ed|ing|er|s)?\b"
 }
 
-# Keywords to match market questions (case-insensitive)
 polymarket_keywords = {
     "Dollar": "dollar",
     "Thousand/Million": "thousand|million|billion",
@@ -110,26 +112,24 @@ polymarket_keywords = {
     "Subscribe": "subscribe"
 }
 
-# Fixed thresholds (as requested — no dynamic parsing)
+# Fixed thresholds
 thresholds = {
     "Dollar": 10,
     "Thousand/Million": 10,
     **{cat: 1 for cat in word_groups if cat not in ["Dollar", "Thousand/Million"]}
 }
 
-# Fetch Polymarket data using slug (fixes "no active market" error)
-def get_polymarket_data():
-    if not MARKET_SLUG:
-        print("MARKET_SLUG not set")
+# Fetch Polymarket data for a specific slug
+def get_polymarket_data(slug):
+    if not slug:
         return None, None
 
     try:
-        url = f"https://gamma-api.polymarket.com/events/slug/{MARKET_SLUG}"
+        url = f"https://gamma-api.polymarket.com/events/slug/{slug}"
         response = requests.get(url, timeout=15)
         response.raise_for_status()
         data = response.json()
 
-        # API sometimes wraps in {"event": {...}}, handle both
         event = data.get("event", data)
         markets = event.get("markets", [])
 
@@ -151,10 +151,9 @@ def get_polymarket_data():
             if matched_cat:
                 outcome_prices = market.get("outcomePrices") or market.get("outcome_prices", [])
                 if outcome_prices and len(outcome_prices) >= 2:
-                    yes_price = float(outcome_prices[0])  # Yes is always first
+                    yes_price = float(outcome_prices[0])
                     prices[matched_cat] = yes_price
 
-                # Prefer tokens array, fallback to clobTokenIds
                 yes_token = None
                 for token in market.get("tokens", []):
                     if token.get("outcome", "").lower() == "yes":
@@ -162,8 +161,6 @@ def get_polymarket_data():
                         break
                 if yes_token:
                     token_ids[matched_cat] = yes_token
-                elif "clobTokenIds" in market and market["clobTokenIds"]:
-                    token_ids[matched_cat] = market["clobTokenIds"][0]  # Yes first
 
         return prices, token_ids
 
@@ -171,12 +168,14 @@ def get_polymarket_data():
         print(f"Polymarket fetch error: {e}")
         return None, None
 
-def format_results(text_lower):
+def format_results(text_lower, slug):
+    if not slug:
+        return "<b>Please set the market slug first using /setslug</b>"
+
     counts = {cat: len(re.findall(pattern, text_lower)) for cat, pattern in word_groups.items()}
     sorted_counts = dict(sorted(counts.items()))
     total = sum(sorted_counts.values())
 
-    # Word count table
     msg = "<pre>"
     msg += f"{'Category':<30} {'Count':>8}\n"
     msg += "-" * 40 + "\n"
@@ -186,14 +185,13 @@ def format_results(text_lower):
     msg += f"{'TOTAL':<30} {total:>8}\n"
     msg += "</pre>"
 
-    # Polymarket section
-    prices, token_ids = get_polymarket_data()
+    prices, token_ids = get_polymarket_data(slug)
     poly_section = ""
     opportunities = []
     trade_section = ""
 
     if prices:
-        poly_section += "\n<b>📈 Polymarket MrBeast Markets (Live Yes Prices)</b>\n<pre>"
+        poly_section += "\n<b>📈 Live Yes Prices (slug: {slug})</b>\n<pre>"
         poly_section += f"{'Category':<30} {'Count':>6} {'≥Thresh':>9} {'Yes ¢':>8} {'Status':>20}\n"
         poly_section += "-" * 80 + "\n"
 
@@ -211,15 +209,14 @@ def format_results(text_lower):
 
         poly_section += "-" * 80 + "\n"
         if opportunities:
-            poly_section += f"\n<b>🚨 {len(opportunities)} OPPORTUNITIES DETECTED!</b>"
+            poly_section += f"\n<b>🚨 {len(opportunities)} OPPORTUNITIES!</b>"
         else:
-            poly_section += "\nNo strong edges right now."
+            poly_section += "\nNo strong edges."
         poly_section += "</pre>"
     else:
-        poly_section += "\n<i>⚠️ No active market found / API issue / wrong slug. Set MARKET_SLUG env var correctly.</i>"
+        poly_section += "\n<i>⚠️ Invalid slug / no active markets / API issue.</i>"
 
-    # Auto-trading (market orders for fast fill)
-    if AUTO_TRADE and PRIVATE_KEY and opportunities and prices:
+    if AUTO_TRADE and PRIVATE_KEY and opportunities:
         try:
             pk = PRIVATE_KEY[2:] if PRIVATE_KEY.startswith("0x") else PRIVATE_KEY
             client = ClobClient(host="https://clob.polymarket.com", key=pk, chain_id=137)
@@ -229,11 +226,10 @@ def format_results(text_lower):
             client.api_passphrase = creds["api_passphrase"]
 
             address = client.get_address() or WALLET_ADDRESS or "unknown"
-            trade_section += f"\n<b>🤖 Auto-trading from {address[:8]}... (${TRADE_AMOUNT} per opp)</b>"
+            trade_section += f"\n<b>🤖 Auto-trading from {address[:8]}... (${TRADE_AMOUNT} each)</b>"
 
             for cat, token_id, yes_p in opportunities:
                 if not token_id:
-                    trade_section += f"\n⚠️ {cat}: No token_id"
                     continue
 
                 mo = MarketOrderArgs(
@@ -252,27 +248,57 @@ def format_results(text_lower):
                 except Exception as e:
                     trade_section += f"\n❌ {cat}: {str(e)[:80]}"
         except Exception as e:
-            trade_section += f"\n❌ Trading setup failed: {str(e)[:150]}"
+            trade_section += f"\n❌ Trading failed: {str(e)[:150]}"
 
     return f"<b>MrBeast Word Count + Sniper 🚀</b>\n\n{msg}{poly_section}{trade_section}"
 
-@bot.message_handler(commands=['start', 'help'])
-def send_welcome(message):
-    welcome_text = (
-        "<b>MrBeast Word Counter + Polymarket Sniper Bot! 👋</b>\n\n"
-        "Send YouTube URL/ID, transcript text, or .txt file.\n\n"
-        "Features:\n"
-        "• Auto-transcript + buzzword counts\n"
-        "• Live Polymarket odds for current MrBeast event\n"
-        "• Fixed thresholds: Dollar & Thousand/Million ≥10, others ≥1\n"
-        f"• Current slug: {MARKET_SLUG}\n"
-        f"• Auto-snipe Yes shares (${TRADE_AMOUNT} each if AUTO_TRADE=true)\n\n"
-        f"Wallet: {WALLET_ADDRESS or 'Not configured'}"
-    )
-    bot.reply_to(message, welcome_text, parse_mode='HTML')
+@bot.message_handler(commands=['start', 'help', 'setslug'])
+def handle_commands(message):
+    chat_id = message.chat.id
+    current_slug = slug_per_chat.get(chat_id)
+
+    if message.text.startswith('/setslug') or not current_slug:
+        bot.reply_to(message, "🔗 Please send the Polymarket event slug (e.g. what-will-mrbeast-say-during-his-next-youtube-video):")
+        waiting_for_slug.add(chat_id)
+    else:
+        welcome_text = (
+            f"<b>MrBeast Word Counter + Polymarket Sniper Bot! 👋</b>\n\n"
+            f"Current slug: <code>{current_slug}</code>\n\n"
+            "Send:\n"
+            "• YouTube URL / video ID\n"
+            "• Transcript text\n"
+            "• .txt file\n\n"
+            f"Auto-snipe: {'ON' if AUTO_TRADE else 'OFF'} (${TRADE_AMOUNT} each)\n"
+            f"Wallet: {WALLET_ADDRESS or 'Not set'}\n\n"
+            "Change slug: /setslug"
+        )
+        bot.reply_to(message, welcome_text, parse_mode='HTML')
 
 @bot.message_handler(content_types=['text'])
 def handle_text(message):
+    chat_id = message.chat.id
+
+    # Waiting for slug
+    if chat_id in waiting_for_slug:
+        slug = message.text.strip().lower().replace(" ", "-")
+        prices, _ = get_polymarket_data(slug)
+
+        if prices:
+            slug_per_chat[chat_id] = slug
+            waiting_for_slug.discard(chat_id)
+
+            market_list = "\n".join([f"• {cat}: {prices[cat]:.2f}¢" for cat in sorted(prices)])
+            bot.reply_to(message, f"<b>✅ Slug set: {slug}</b>\n\nSupported markets:\n{market_list}\n\nNow send a YouTube video link, ID, transcript, or .txt file!")
+        else:
+            bot.reply_to(message, "❌ Invalid slug or no active markets found. Send again:")
+        return
+
+    # Normal processing
+    current_slug = slug_per_chat.get(chat_id)
+    if not current_slug:
+        bot.reply_to(message, "Please set the market slug first with /setslug")
+        return
+
     user_text = message.text.strip()
     if not user_text:
         return
@@ -289,19 +315,30 @@ def handle_text(message):
             response.raise_for_status()
             raw_text = extract_transcript_text(response.json())
             if not raw_text.strip():
-                bot.reply_to(message, "No transcript found. Paste manually.")
+                bot.reply_to(message, "No transcript found. Paste manually or send .txt.")
                 return
         except Exception as e:
-            bot.reply_to(message, f"❌ Fetch error: {str(e)[:200]}")
+            bot.reply_to(message, f"❌ Fetch error: {str(e)[:200]}. Paste manually.")
             return
     else:
         raw_text = user_text
 
-    result_msg = format_results(raw_text.lower())
-    bot.send_message(message.chat.id, result_msg, parse_mode='HTML')
+    result_msg = format_results(raw_text.lower(), current_slug)
+    bot.send_message(chat_id, result_msg, parse_mode='HTML')
 
 @bot.message_handler(content_types=['document'])
 def handle_document(message):
+    chat_id = message.chat.id
+
+    if chat_id in waiting_for_slug:
+        bot.reply_to(message, "⏳ Waiting for slug as text. Send the slug first.")
+        return
+
+    current_slug = slug_per_chat.get(chat_id)
+    if not current_slug:
+        bot.reply_to(message, "Please set the market slug first with /setslug")
+        return
+
     doc = message.document
     if not (doc.mime_type == 'text/plain' or doc.file_name.lower().endswith('.txt')):
         bot.reply_to(message, "Send a plain .txt file only.")
@@ -312,10 +349,10 @@ def handle_document(message):
         file_info = bot.get_file(doc.file_id)
         downloaded = bot.download_file(file_info.file_path)
         transcript = downloaded.decode('utf-8', errors='replace')
-        result_msg = format_results(transcript.lower())
-        bot.send_message(message.chat.id, result_msg, parse_mode='HTML')
+        result_msg = format_results(transcript.lower(), current_slug)
+        bot.send_message(chat_id, result_msg, parse_mode='HTML')
     except Exception as e:
-        bot.reply_to(message, f"❌ File error: {str(e)}")
+        bot.reply_to(message, f"❌ Error: {str(e)}")
 
 print("Bot running...")
 bot.infinity_polling()

@@ -103,41 +103,7 @@ thresholds = {
     **{cat: 1 for cat in word_groups if cat not in ["Dollar", "Thousand/Million"]}
 }
 
-# UPDATED: More specific market mapping to avoid duplicates
-market_mapping = {
-    # Order matters - more specific matches first
-    "subscribe": "Subscribe",
-    "insane": "Insane",
-    "beast games": "Beast Games",
-    "feastables": "Feastables",
-    "mrbeast": "MrBeast",
-    "mr beast": "MrBeast",
-    "mystery box": "Mystery Box",
-    "world's biggest": "World's Biggest/Largest",
-    "world's largest": "World's Biggest/Largest",
-    "tesla": "Tesla/Lamborghini",
-    "lamborghini": "Tesla/Lamborghini",
-    "supercar": "Car/Supercar",
-    "car": "Car/Supercar",
-    "helicopter": "Helicopter/Jet",
-    "jet": "Helicopter/Jet",
-    "thousand": "Thousand/Million",
-    "million": "Thousand/Million",
-    "eliminated": "Eliminated",
-    "challenge": "Challenge",
-    "massive": "Massive",
-    "island": "Island",
-    "dollar": "Dollar",
-    "trap": "Trap",
-}
-
 def match_market_to_category(question_lower):
-    """Match Polymarket question to bot category by finding the quoted word/phrase"""
-    
-    # Strategy: Extract what word is being asked about (usually in quotes)
-    # Example: 'Will MrBeast say "Dollar" 10+ times' -> look for "dollar"
-    
-    # Multi-word phrases (check these first as they're most specific)
     if '"beast games"' in question_lower or "'beast games'" in question_lower or "beast games" in question_lower:
         return "Beast Games"
     
@@ -148,7 +114,6 @@ def match_market_to_category(question_lower):
         "world's biggest" in question_lower or "world's largest" in question_lower):
         return "World's Biggest/Largest"
     
-    # Two-word vehicle phrases
     if '"tesla"' in question_lower or '"lamborghini"' in question_lower or ("tesla" in question_lower and "lamborghini" in question_lower):
         return "Tesla/Lamborghini"
     
@@ -158,15 +123,12 @@ def match_market_to_category(question_lower):
     if '"car"' in question_lower or '"supercar"' in question_lower or ("car" in question_lower and "supercar" in question_lower):
         return "Car/Supercar"
     
-    # Number words with 10+ context
     if ('"thousand"' in question_lower or '"million"' in question_lower) and "10+" in question_lower:
         return "Thousand/Million"
     
-    # Dollar with 10+ context
     if '"dollar"' in question_lower and "10+" in question_lower:
         return "Dollar"
     
-    # Single word checks - look for the word in quotes
     if '"subscribe"' in question_lower:
         return "Subscribe"
     
@@ -196,7 +158,41 @@ def match_market_to_category(question_lower):
     
     return None
 
-# Polymarket fetch - IMPROVED with better matching
+def get_token_id_for_outcome(market, target_outcome):
+    target = target_outcome.lower()
+    # Method 1: tokens array
+    tokens = market.get("tokens", [])
+    for token in tokens:
+        if token.get("outcome", "").lower() == target:
+            tid = token.get("token_id")
+            if tid is not None:
+                return str(tid)
+    # Method 2: outcomes + clobTokenIds
+    outcomes_raw = market.get("outcomes", [])
+    if isinstance(outcomes_raw, str):
+        try:
+            outcomes = json.loads(outcomes_raw)
+        except:
+            outcomes = []
+    else:
+        outcomes = outcomes_raw or []
+    clob_ids_raw = market.get("clobTokenIds", []) or market.get("clob_token_ids", [])
+    if isinstance(clob_ids_raw, str):
+        try:
+            clob_ids = json.loads(clob_ids_raw)
+        except:
+            clob_ids = []
+    else:
+        clob_ids = clob_ids_raw or []
+    for idx, outcome in enumerate(outcomes):
+        if str(outcome).lower() == target:
+            if idx < len(clob_ids):
+                tid = clob_ids[idx]
+                if tid is not None:
+                    return str(tid)
+    return None
+
+# Polymarket fetch
 def get_polymarket_data():
     try:
         url = f"https://gamma-api.polymarket.com/events/slug/{POLYMARKET_SLUG}"
@@ -214,29 +210,26 @@ def get_polymarket_data():
         
         prices = {}
         token_ids = {}
-        matched_categories = set()  # Track which categories we've seen
+        matched_categories = set()
         
         for market in markets:
             question = market.get("question", "")
             question_lower = question.lower()
             
-            # Match to category
             matched_cat = match_market_to_category(question_lower)
             
             if not matched_cat:
                 print(f"❌ No match: {question}")
                 continue
             
-            # Check for duplicates
             if matched_cat in matched_categories:
                 print(f"⚠️  DUPLICATE MATCH for {matched_cat}: {question[:60]}...")
-                print(f"   Skipping duplicate - keeping first match")
                 continue
             
             matched_categories.add(matched_cat)
             print(f"✅ {matched_cat:<25} ← {question[:50]}...")
             
-            # Get price
+            # Get yes price
             outcome_prices = market.get("outcome_prices") or market.get("outcomePrices", [])
             if isinstance(outcome_prices, str):
                 try:
@@ -244,71 +237,40 @@ def get_polymarket_data():
                 except:
                     outcome_prices = []
             
+            yes_price = None
             if isinstance(outcome_prices, list) and len(outcome_prices) > 0:
                 yes_price = float(outcome_prices[0])
-                prices[matched_cat] = yes_price
-                print(f"   Price: {yes_price:.4f} ({yes_price*100:.1f}¢)")
+                print(f"   Yes Price: {yes_price:.4f} ({yes_price*100 coordinators:.1f}¢)")
             else:
                 print(f"   ⚠️  NO PRICE DATA")
             
-            # Get token ID - Multiple methods
-            token_id = None
+            # Get token IDs
+            yes_token = get_token_id_for_outcome(market, "yes")
+            no_token = get_token_id_for_outcome(market, "no")
             
-            # Method 1: tokens array
-            tokens = market.get("tokens", [])
-            if tokens:
-                for token in tokens:
-                    if token.get("outcome", "").lower() == "yes":
-                        token_id = token.get("token_id")
-                        if token_id:
-                            token_id = str(token_id)
-                            print(f"   Token: {token_id}")
-                            break
-            
-            # Method 2: clobTokenIds
-            if not token_id:
-                outcomes = market.get("outcomes", [])
-                clob_ids = market.get("clobTokenIds", []) or market.get("clob_token_ids", [])
-                
-                if isinstance(outcomes, str):
-                    try:
-                        outcomes = json.loads(outcomes)
-                    except:
-                        outcomes = []
-                
-                if isinstance(clob_ids, str):
-                    try:
-                        clob_ids = json.loads(clob_ids)
-                    except:
-                        clob_ids = []
-                
-                for idx, outcome in enumerate(outcomes):
-                    if str(outcome).lower() == "yes":
-                        if idx < len(clob_ids):
-                            token_id = str(clob_ids[idx])
-                            print(f"   Token: {token_id}")
-                        break
-            
-            # Method 3: condition_id
-            if not token_id:
-                condition_id = market.get("condition_id")
-                if condition_id:
-                    token_id = str(condition_id)
-                    print(f"   Token: {token_id}")
-            
-            # Store data
-            if token_id:
-                token_ids[matched_cat] = token_id
+            if yes_token:
+                print(f"   Yes Token: {yes_token}")
             else:
-                print(f"   ⚠️  NO TOKEN_ID")
+                print(f"   ⚠️  Missing Yes Token")
+            if no_token:
+                print(f"   No Token: {no_token}")
+            else:
+                print(f"   ⚠️  Missing No Token")
             
-            print()  # Blank line between markets
+            if yes_price is not None:
+                prices[matched_cat] = yes_price
+            
+            token_ids[matched_cat] = {
+                "yes": yes_token,
+                "no": no_token
+            }
+            
+            print()
         
-        print(f"📊 Summary: {len(prices)} with prices, {len(token_ids)} with token_ids\n")
+        print(f"📊 Summary: {len(prices)} with prices, {len(token_ids)} categories with tokens\n")
         
-        # Debug: Show what's missing
         all_categories = set(word_groups.keys())
-        found_categories = set(prices.keys()) | set(token_ids.keys())
+        found_categories = set(prices.keys())
         missing_categories = all_categories - found_categories
         
         if missing_categories:
@@ -316,13 +278,6 @@ def get_polymarket_data():
             for cat in sorted(missing_categories):
                 print(f"   - {cat}")
             print()
-        
-        # Show data issues
-        for cat in found_categories:
-            if cat not in prices:
-                print(f"⚠️  {cat}: Has token_id but NO PRICE")
-            elif cat not in token_ids:
-                print(f"⚠️  {cat}: Has price but NO TOKEN_ID")
         
         return prices, token_ids
         
@@ -337,54 +292,63 @@ def format_results(text_lower):
     sorted_counts = dict(sorted(counts.items()))
     total = sum(sorted_counts.values())
     
-    # Compact counts (only show non-zero or meeting threshold)
     msg = "<b>📊 Word Counts</b>\n<pre>"
     for category, count in sorted_counts.items():
         thresh = thresholds.get(category, 1)
         if count >= thresh:
             msg += f"{category:<20} {count:>3} ✅\n"
         elif count > 0:
+            msg += f"{category:<20} {count:>3} ❌\n"
+        else:
             msg += f"{category:<20} {count:>3}\n"
     msg += f"{'─'*25}\nTOTAL: {total}\n</pre>"
 
     prices, token_ids = get_polymarket_data()
-    opportunities = []
     
-    # Build opportunities list
+    opportunities = []
+    missing_data = []
+    
     if prices:
-        meets_threshold = 0
-        missing_data = []
-        
         for cat, count in sorted_counts.items():
             thresh = thresholds.get(cat, 1)
             yes_p = prices.get(cat)
-            token_id = token_ids.get(cat)
+            if yes_p is None:
+                continue
+            no_p = 1.0 - yes_p
+            
+            tokens = token_ids.get(cat, {})
+            yes_token = tokens.get("yes")
+            no_token = tokens.get("no")
             
             if count >= thresh:
-                meets_threshold += 1
-                
-                if yes_p is None or token_id is None:
-                    missing_data.append(cat)
-                elif yes_p < 0.95:
-                    opportunities.append((cat, token_id, yes_p))
+                # Believe Yes
+                if yes_p < 0.95 and yes_token:
+                    edge = int((1.0 - yes_p) / yes_p * 100) if yes_p > 0 else 999
+                    opportunities.append((cat, "Yes", yes_token, yes_p, edge))
+                elif yes_p < 0.95 and not yes_token:
+                    missing_data.append(f"{cat} (Yes)")
+            else:
+                # Believe No
+                if no_p < 0.95 and no_token:
+                    edge = int((1.0 - no_p) / no_p * 100) if no_p > 0 else 999
+                    opportunities.append((cat, "No", no_token, no_p, edge))
+                elif no_p < 0.95 and not no_token:
+                    missing_data.append(f"{cat} (No)")
         
-        # Compact opportunities display
-        poly_section = f"\n<b>🎯 Opportunities: {len(opportunities)}/{meets_threshold}</b>"
+        poly_section = f"\n<b>🎯 Opportunities: {len(opportunities)}</b>"
         
         if opportunities:
             poly_section += "\n<pre>"
-            for cat, token_id, yes_p in opportunities:
-                edge = int((1.0 - yes_p) / yes_p * 100)
-                poly_section += f"{cat:<20} {yes_p:.2f} ~{edge}%\n"
+            for cat, side, _, price, edge in opportunities:
+                poly_section += f"{cat:<20} {side} {price:.2f} ~{edge}%\n"
             poly_section += "</pre>"
         
         if missing_data:
-            poly_section += f"\n<i>⚠️ {len(missing_data)} missing data: {', '.join(missing_data[:3])}</i>"
+            poly_section += f"\n<i>⚠️ Missing token for: {', '.join(missing_data[:5])}</i>"
     else:
         poly_section = "\n<i>⚠️ Failed to fetch market data.</i>"
         opportunities = []
 
-    # Trading section (compact)
     trade_results = []
     if AUTO_TRADE and PRIVATE_KEY and opportunities:
         actual_trade_amt = max(TRADE_AMOUNT, MIN_TRADE_AMOUNT)
@@ -401,11 +365,9 @@ def format_results(text_lower):
             creds = client.create_or_derive_api_creds()
             client.set_api_creds(creds)
             
-            # Log client info
             address = client.get_address()
             print(f"\n🔑 Trading wallet: {address}")
             
-            # Check balance
             try:
                 balance_resp = client.get_balance()
                 usdc_balance = float(balance_resp.get("balance", 0)) / 1e6
@@ -417,17 +379,16 @@ def format_results(text_lower):
             except Exception as e:
                 print(f"⚠️  Balance check failed: {e}")
             
-            for cat, token_id, yes_p in opportunities:
+            for cat, side, token_id, price, edge in opportunities:
                 try:
-                    print(f"\n📊 Trading {cat}:")
+                    print(f"\n📊 Trading {cat} on {side}:")
                     print(f"   Token: {token_id}")
-                    print(f"   Price: {yes_p:.4f}")
+                    print(f"   Price: {price:.4f}")
                     print(f"   Amount: ${actual_trade_amt}")
                     
-                    # Use market order with USD amount (simple!)
                     args = MarketOrderArgs(
                         token_id=token_id,
-                        amount=actual_trade_amt,  # USD amount
+                        amount=actual_trade_amt,
                         side=BUY,
                     )
                     
@@ -435,7 +396,7 @@ def format_results(text_lower):
                     signed = client.create_market_order(args)
                     
                     print(f"   Posting order...")
-                    resp = client.post_order(signed, OrderType.FOK)  # FOK = Fill or Kill (immediate)
+                    resp = client.post_order(signed, OrderType.FOK)
                     
                     print(f"   Response: {resp}")
                     
@@ -445,39 +406,29 @@ def format_results(text_lower):
                     
                     if order_id or success or status in ["matched", "live", "open"]:
                         print(f"   ✅ Success! Status: {status}")
-                        trade_results.append(f"✅ {cat[:15]} ${actual_trade_amt}")
-                        time.sleep(0.5)  # Rate limit pause
+                        trade_results.append(f"✅ {cat[:12]} {side} ${actual_trade_amt}")
+                        time.sleep(0.5)
                     else:
                         error = resp.get('error') or resp.get('errorMsg') or resp.get('message', 'No fill')
                         print(f"   ⚠️  Order failed: {error}")
-                        trade_results.append(f"⚠️ {cat[:15]} No fill")
+                        trade_results.append(f"⚠️ {cat[:12]} {side} No fill")
                 
                 except Exception as e:
                     error_str = str(e)
                     print(f"   ❌ Error: {error_str}")
-                    
-                    # Parse common errors
-                    if "status_code=400" in error_str:
-                        if "insufficient" in error_str.lower():
-                            trade_results.append(f"❌ {cat[:15]} Low balance")
-                        else:
-                            trade_results.append(f"❌ {cat[:15]} API error")
-                    else:
-                        trade_results.append(f"❌ {cat[:15]} Error")
-                    
+                    trade_results.append(f"❌ {cat[:12]} {side} Error")
                     time.sleep(0.5)
         
         except Exception as e:
             error_msg = str(e)
             print(f"\n❌ Trading setup failed: {error_msg}")
-            trade_results.append(f"❌ Setup: {error_msg[:30]}")
-    
-    # Combine results
+            trade_results.append(f"❌ Setup failed")
+
     result = f"<b>MrBeast Sniper 🚀</b>\n\n{msg}{poly_section}"
     
     if trade_results:
         result += f"\n\n<b>🤖 Trades (${max(TRADE_AMOUNT, MIN_TRADE_AMOUNT)})</b>\n"
-        result += "\n".join(trade_results[:10])  # Limit to 10 trades shown
+        result += "\n".join(trade_results[:10])
     elif AUTO_TRADE and opportunities:
         result += "\n\n<i>AUTO_TRADE enabled but no trades executed</i>"
     
@@ -493,6 +444,7 @@ def send_welcome(message):
         f"Market: {POLYMARKET_SLUG}\n"
         "• Fixed thresholds (Dollar & Thousand/Million: 10+, others: 1+)\n"
         "• Live Yes prices from Polymarket\n"
+        "• Now trades on both Yes (threshold met) and No (threshold not met) when edge exists\n"
         f"• Trade amount: ${actual_trade_amt} per opp (set via TRADE_AMOUNT)\n"
         f"• Min trade: ${MIN_TRADE_AMOUNT} (set via MIN_TRADE_AMOUNT)\n"
         f"• Wallet: {WALLET_ADDRESS[:10]}...{WALLET_ADDRESS[-6:] if WALLET_ADDRESS else 'Not set'}\n"

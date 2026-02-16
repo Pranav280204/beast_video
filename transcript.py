@@ -16,9 +16,7 @@ if os.environ.get("AUTO_TRADE", "false").lower() == "true":
 # Environment variables
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 API_TOKEN = os.environ.get("API_TOKEN")
-PRIVATE_KEY = os.environ.get
-
-("PRIVATE_KEY")
+PRIVATE_KEY = os.environ.get("PRIVATE_KEY")
 WALLET_ADDRESS = os.environ.get("WALLET_ADDRESS")
 AUTO_TRADE = os.environ.get("AUTO_TRADE", "false").lower() == "true"
 TRADE_AMOUNT = float(os.environ.get("TRADE_AMOUNT", "1.0"))  # Starting USD per opportunity
@@ -171,10 +169,10 @@ def get_polymarket_data():
                         idx = lower_outcomes.index("yes")
                         if idx < len(clob_ids):
                             token_ids[matched_cat] = clob_ids[idx]
-        return prices, token_ids
+        return prices or {}, token_ids or {}
     except Exception as e:
         print(f"Polymarket fetch error: {e}")
-        return None, None
+        return {}, {}
 
 def format_results(text_lower):
     counts = {cat: len(re.findall(pattern, text_lower)) for cat, pattern in word_groups.items()}
@@ -194,7 +192,7 @@ def format_results(text_lower):
     opportunities = []
     trade_section = ""
 
-    if prices or unele token_ids:
+    if token_ids:
         poly_section += "\n<b>📈 Polymarket MrBeast Next Video Markets</b>\n<pre>"
         poly_section += f"{'Category':<30} {'Count':>6} {'≥Thresh':>9} {'Yes ¢':>8} {'Status':>30}\n"
         poly_section += "-" * 90 + "\n"
@@ -203,18 +201,21 @@ def format_results(text_lower):
             yes_p = prices.get(cat)
             token_id = token_ids.get(cat)
             status = ""
+            thresh_str = f"≥{thresh}" if count >= thresh else ""
             if count >= thresh and token_id:
                 status = "SNIPABLE"
-                if yes_p is not None and yes_p > 0:
+                if yes_p is not None and yes_p > 0 and yes_p < 1.0:
                     edge = (1.0 - yes_p) / yes_p * 100
                     status += f" (~{edge:.0f}% edge)"
-                elif yes_p is not None and yes_p == 0:
+                elif yes_p is not None and yes_p <= 0:
                     status += " (infinite edge)"
-                else:
+                elif yes_p is None:
                     status += " (blind buy)"
+                else:
+                    status += " (low/no edge)"
                 opportunities.append((cat, token_id, yes_p))
             yes_str = f"{yes_p:.2f}" if yes_p is not None else "N/A"
-            poly_section += f"{cat:<30} {count:>6} {f'≥{thresh}' if count >= thresh else '':>9} {yes_str:>8} {status:>30}\n"
+            poly_section += f"{cat:<30} {count:>6} {thresh_str:>9} {yes_str:>8} {status:>30}\n"
         poly_section += "-" * 90 + "\n"
         if opportunities:
             poly_section += f"\n<b>🚨 {len(opportunities)} OPPORTUNITIES!</b>"
@@ -222,7 +223,7 @@ def format_results(text_lower):
             poly_section += "\n<b>No strong edges.</b>"
         poly_section += "</pre>"
     else:
-        poly_section += "\n<i>⚠️ Failed to fetch market data.</i>"
+        poly_section += "\n<i>⚠️ Failed to fetch market data or no matching markets.</i>"
 
     # Auto-trading with retry on smaller amounts for low liquidity
     if AUTO_TRADE and PRIVATE_KEY and opportunities:
@@ -257,13 +258,14 @@ def format_results(text_lower):
                             trade_section += f"\n✅ Bought {cat} Yes (~${current_amount:.2f})"
                             bought = True
                         else:
-                            trade_section += f"\n⚠️ {cat} no fill at ${current_amount:.2f}, retrying half..."
+                            reason = resp.get("message", "No fill")
+                            trade_section += f"\n⚠️ {cat} no fill at ${current_amount:.2f} ({reason}), retrying half..."
                             current_amount /= 2
                     except Exception as e:
                         trade_section += f"\n❌ {cat} error: {str(e)[:80]}"
                         break
                 if not bought:
-                    trade_section += f"\n⚠️ {cat} failed (even at ${MIN_TRADE_AMOUNT})"
+                    trade_section += f"\n⚠️ {cat} failed entirely (even at ${MIN_TRADE_AMOUNT})"
         except Exception as e:
             trade_section += f"\n❌ Trading setup failed: {str(e)[:150]}"
     elif AUTO_TRADE:
@@ -271,7 +273,7 @@ def format_results(text_lower):
 
     return f"<b>MrBeast Word Count + Sniper 🚀</b>\n\n{msg}{poly_section}{trade_section}"
 
-# Handlers (unchanged)
+# Handlers
 @bot.message_handler(commands=['start', 'help'])
 def send_welcome(message):
     welcome_text = (
@@ -279,8 +281,9 @@ def send_welcome(message):
         "Send YouTube URL/ID, transcript text, or .txt file.\n\n"
         f"Market: {POLYMARKET_SLUG}\n"
         "• Fixed thresholds (Dollar & Thousand/Million: 10+, others: 1+)\n"
-        "• Live Yes prices\n"
-        f"• Auto market-buy Yes shares (starts at ${TRADE_AMOUNT}, halves on no-fill down to ${MIN_TRADE_AMOUNT})\n\n"
+        "• Live Yes prices when available\n"
+        f"• Auto market-buy Yes shares (starts at ${TRADE_AMOUNT}, halves on no-fill down to ${MIN_TRADE_AMOUNT})\n"
+        f"• Buys blindly if price N/A but market exists and threshold met\n\n"
         f"Wallet: {WALLET_ADDRESS or 'Not set'} | AutoTrade: {AUTO_TRADE}"
     )
     bot.reply_to(message, welcome_text, parse_mode='HTML')

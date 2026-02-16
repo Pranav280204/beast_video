@@ -3,35 +3,36 @@ import re
 import requests
 import telebot
 import hashlib
-import json  # Added for safe parsing
+import json
 from ecdsa import SigningKey, SECP256k1
 
 # Polymarket trading (only if AUTO_TRADE enabled)
 if os.environ.get("AUTO_TRADE", "false").lower() == "true":
     from py_clob_client.client import ClobClient
-    from py_clob_client.clob_types import OrderArgs
-    from py_clob_client.constants import BUY
+    from py_clob_client.clob_types import MarketOrderArgs
+    from py_clob_client.order_builder.constants import BUY
+    from py_clob_client.clob_types import OrderType
 
 # Environment variables
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 API_TOKEN = os.environ.get("API_TOKEN")
-PRIVATE_KEY = os.environ.get("PRIVATE_KEY")  # Revealed magic key (with or without 0x)
-WALLET_ADDRESS = os.environ.get("WALLET_ADDRESS")  # Optional, auto-derived if missing
+PRIVATE_KEY = os.environ.get("PRIVATE_KEY")
+WALLET_ADDRESS = os.environ.get("WALLET_ADDRESS")
 AUTO_TRADE = os.environ.get("AUTO_TRADE", "false").lower() == "true"
 TRADE_AMOUNT = float(os.environ.get("TRADE_AMOUNT", "20"))  # USD per opportunity
-POLYMARKET_SLUG = os.environ.get("POLYMARKET_SLUG", "").strip()  # REQUIRED
+POLYMARKET_SLUG = os.environ.get("POLYMARKET_SLUG", "").strip()
 
 if not BOT_TOKEN:
     print("ERROR: BOT_TOKEN not set!")
     exit(1)
 
 if not POLYMARKET_SLUG:
-    print("ERROR: POLYMARKET_SLUG not set in environment variables!")
+    print("ERROR: POLYMARKET_SLUG not set!")
     exit(1)
 
 bot = telebot.TeleBot(BOT_TOKEN)
 
-# Derive address if not provided
+# Derive address
 def derive_address(private_key: str) -> str:
     pk = private_key[2:] if private_key.startswith('0x') else private_key
     priv_key_bytes = bytes.fromhex(pk)
@@ -56,7 +57,7 @@ def extract_video_id(user_input):
             return match.group(1)
     return None
 
-# Clean transcript extraction
+# Transcript extraction
 def extract_transcript_text(data):
     text_parts = []
     def collect(obj):
@@ -74,7 +75,7 @@ def extract_transcript_text(data):
     collect(data)
     return " ".join(text_parts)
 
-# Fixed word groups
+# Word groups & thresholds
 word_groups = {
     "Dollar": r"\bdollar(s)?\b",
     "Thousand/Million": r"\b(thousand|million|billion)(s)?\b",
@@ -95,14 +96,12 @@ word_groups = {
     "Subscribe": r"\bsubscrib(e|ed|ing|er|s)?\b"
 }
 
-# Fixed thresholds
 thresholds = {
     "Dollar": 10,
     "Thousand/Million": 10,
     **{cat: 1 for cat in word_groups if cat not in ["Dollar", "Thousand/Million"]}
 }
 
-# Keyword mapping
 market_mapping = {
     "dollar 10+ times": "Dollar",
     "thousand / million 10+ times": "Thousand/Million",
@@ -123,7 +122,7 @@ market_mapping = {
     "subscribe": "Subscribe"
 }
 
-# Fetch Polymarket data with robust JSON string handling
+# Polymarket fetch
 def get_polymarket_data():
     try:
         url = f"https://gamma-api.polymarket.com/events/slug/{POLYMARKET_SLUG}"
@@ -147,18 +146,13 @@ def get_polymarket_data():
                     break
 
             if matched_cat:
-                # Robust outcome_prices handling (can be list or JSON string)
                 outcome_prices = market.get("outcome_prices") or market.get("outcomePrices", [])
                 if isinstance(outcome_prices, str):
-                    try:
-                        outcome_prices = json.loads(outcome_prices)
-                    except:
-                        outcome_prices = []
+                    outcome_prices = json.loads(outcome_prices)
                 if isinstance(outcome_prices, list) and len(outcome_prices) > 0:
                     yes_price = float(outcome_prices[0])
                     prices[matched_cat] = yes_price
 
-                # Token handling
                 tokens = market.get("tokens", [])
                 if tokens:
                     for token in tokens:
@@ -166,20 +160,13 @@ def get_polymarket_data():
                             token_ids[matched_cat] = token.get("token_id")
                             break
 
-                # Fallback to clobTokenIds/outcomes if needed
                 if matched_cat not in token_ids:
                     outcomes = market.get("outcomes", [])
                     clob_ids = market.get("clobTokenIds", []) or market.get("clob_token_ids", [])
                     if isinstance(outcomes, str):
-                        try:
-                            outcomes = json.loads(outcomes)
-                        except:
-                            outcomes = []
+                        outcomes = json.loads(outcomes)
                     if isinstance(clob_ids, str):
-                        try:
-                            clob_ids = json.loads(clob_ids)
-                        except:
-                            clob_ids = []
+                        clob_ids = json.loads(clob_ids)
                     if "yes" in [str(o).lower() for o in outcomes]:
                         idx = [str(o).lower() for o in outcomes].index("yes")
                         if idx < len(clob_ids):
@@ -191,7 +178,6 @@ def get_polymarket_data():
         print(f"Polymarket fetch error: {e}")
         return None, None
 
-# Rest of the code unchanged (format_results, handlers, etc.)
 def format_results(text_lower):
     counts = {cat: len(re.findall(pattern, text_lower)) for cat, pattern in word_groups.items()}
     sorted_counts = dict(sorted(counts.items()))
@@ -220,10 +206,11 @@ def format_results(text_lower):
             thresh = thresholds.get(cat, 1)
             yes_p = prices.get(cat)
             status = ""
-            if count >= thresh and yes_p is not None and yes_p < 0.95:
+            token_id = token_ids.get(cat)
+            if count >= thresh and yes_p is not None and yes_p < 0.95 and token_id:
                 edge = (1.0 - yes_p) / yes_p * 100
                 status = f"SNIPABLE (~{edge:.0f}% edge)"
-                opportunities.append((cat, token_ids.get(cat), yes_p))
+                opportunities.append((cat, token_id, yes_p))
 
             yes_str = f"{yes_p:.2f}" if yes_p is not None else "N/A"
             poly_section += f"{cat:<30} {count:>6} {f'≥{thresh}':>9} {yes_str:>8} {status:>20}\n"
@@ -232,12 +219,14 @@ def format_results(text_lower):
         if opportunities:
             poly_section += f"\n<b>🚨 {len(opportunities)} OPPORTUNITIES!</b>"
         else:
-            poly_section += "\nNo strong edges."
+           26            poly_section += "\nNo strong edges."
         poly_section += "</pre>"
     else:
-        poly_section += "\n<i>⚠️ Failed to fetch market data (check POLYMARKET_SLUG or API).</i>"
+        poly_section += "\n<i>⚠️ Failed to fetch market data.</i>"
 
-    if AUTO_TRADE and PRIVATE_KEY and opportunities and prices:
+    # Auto-trading with TRUE MARKET ORDERS
+    if AUTO_TRADE and PRIVATE_KEY and opportunities:
+        trade_section += f"\n<b>🤖 AUTO_TRADING ACTIVE (${TRADE_AMOUNT} per opp)</b>"
         try:
             pk = PRIVATE_KEY[2:] if PRIVATE_KEY.startswith('0x') else PRIVATE_KEY
             client = ClobClient(
@@ -245,41 +234,40 @@ def format_results(text_lower):
                 chain_id=137,
                 key=pk,
                 signature_type=1,
-                funder=WALLET_ADDRESS
+                funder=WALLET_ADDRESS or None
             )
             creds = client.create_or_derive_api_creds()
             client.set_api_creds(creds)
 
             address = client.get_address()
-            trade_section += f"\n<b>🤖 Auto-trading from {address[:8]}... (${TRADE_AMOUNT} per opp)</b>"
+            trade_section += f"\nTrading from {address[:8]}..."
 
             for cat, token_id, yes_p in opportunities:
-                if not token_id:
-                    continue
-                max_price = min(0.99, yes_p + 0.10)
-                size = TRADE_AMOUNT / max_price
-
-                order_args = OrderArgs(
-                    token_id=token_id,
-                    price=max_price,
-                    size=round(size, 6),
-                    side="BUY"
-                )
                 try:
-                    order = client.create_order(order_args)
-                    signed = client.sign_order(order)
-                    resp = client.post_order(signed)
-                    if resp.get("order_id"):
+                    args = MarketOrderArgs(
+                        token_id=token_id,
+                        amount=TRADE_AMOUNT,  # USDC amount
+                        side=BUY,
+                        order_type=OrderType.FOK  # Fill or Kill = market-like
+                    )
+                    signed = client.create_market_order(args)
+                    resp = client.post_order(signed, OrderType.FOK)
+                    if "order_id" in resp or resp.get("status") == "open":
                         trade_section += f"\n✅ Bought {cat} Yes (~${TRADE_AMOUNT})"
                     else:
-                        trade_section += f"\n⚠️ {cat}: {resp.get('message', 'Failed')}"
+                        trade_section += f"\n⚠️ {cat} failed: {resp.get('message', 'No fill')}"
                 except Exception as e:
-                    trade_section += f"\n❌ {cat}: {str(e)[:80]}"
+                    trade_section += f"\n❌ {cat} error: {str(e)[:80]}"
         except Exception as e:
-            trade_section += f"\n❌ Trading failed: {str(e)[:150]}"
+            trade_section += f"\n❌ Trading setup failed: {str(e)[:150]}"
+    elif AUTO_TRADE and PRIVATE_KEY and opportunities:
+        trade_section += "\n<i>⚠️ Some opportunities missing token_id – no trade.</i>"
+    elif AUTO_TRADE:
+        trade_section += "\n<i>AUTO_TRADE=true but no PRIVATE_KEY or no opportunities.</i>"
 
     return f"<b>MrBeast Word Count + Sniper 🚀</b>\n\n{msg}{poly_section}{trade_section}"
 
+# Handlers remain the same
 @bot.message_handler(commands=['start', 'help'])
 def send_welcome(message):
     welcome_text = (
@@ -287,9 +275,9 @@ def send_welcome(message):
         "Send YouTube URL/ID, transcript text, or .txt file.\n\n"
         f"Market: {POLYMARKET_SLUG}\n"
         "• Fixed thresholds (Dollar & Thousand/Million: 10+, others: 1+)\n"
-        "• Live Yes prices from Polymarket\n"
-        f"• Auto-snipe underpriced Yes (${os.environ.get('TRADE_AMOUNT', '20')} per opp if AUTO_TRADE=true)\n\n"
-        f"Wallet: {WALLET_ADDRESS or 'Not set'}"
+        "• Live Yes prices\n"
+        f"• Auto market-buy Yes shares (${TRADE_AMOUNT} per opp if AUTO_TRADE=true)\n\n"
+        f"Wallet: {WALLET_ADDRESS or 'Not set'} | AutoTrade: {AUTO_TRADE}"
     )
     bot.reply_to(message, welcome_text, parse_mode='HTML')
 

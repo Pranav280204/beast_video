@@ -20,11 +20,9 @@ API_TOKEN = os.environ.get("API_TOKEN")
 PRIVATE_KEY = os.environ.get("PRIVATE_KEY")
 WALLET_ADDRESS = os.environ.get("WALLET_ADDRESS")
 AUTO_TRADE = os.environ.get("AUTO_TRADE", "false").lower() == "true"
-TRADE_AMOUNT = float(os.environ.get("TRADE_AMOUNT", "20"))
+TRADE_AMOUNT = float(os.environ.get("TRADE_AMOUNT", "10"))  # Default $10
+MIN_TRADE_AMOUNT = float(os.environ.get("MIN_TRADE_AMOUNT", "1"))  # Min $1 (configurable)
 POLYMARKET_SLUG = os.environ.get("POLYMARKET_SLUG", "what-will-mrbeast-say-during-his-next-youtube-video").strip()
-
-# Minimum trade amount
-MIN_TRADE_AMOUNT = 5.0
 
 if not BOT_TOKEN:
     print("ERROR: BOT_TOKEN not set!")
@@ -440,13 +438,15 @@ def format_results(text_lower):
 # Handlers
 @bot.message_handler(commands=['start', 'help'])
 def send_welcome(message):
+    actual_trade_amt = max(TRADE_AMOUNT, MIN_TRADE_AMOUNT)
     welcome_text = (
         "<b>MrBeast Word Counter + Polymarket Sniper Bot! 👋</b>\n\n"
         "Send YouTube URL/ID, transcript text, or .txt file.\n\n"
         f"Market: {POLYMARKET_SLUG}\n"
         "• Fixed thresholds (Dollar & Thousand/Million: 10+, others: 1+)\n"
         "• Live Yes prices from Polymarket\n"
-        f"• Auto-trade: ${max(TRADE_AMOUNT, MIN_TRADE_AMOUNT)} per opp (min ${MIN_TRADE_AMOUNT})\n"
+        f"• Trade amount: ${actual_trade_amt} per opp (set via TRADE_AMOUNT)\n"
+        f"• Min trade: ${MIN_TRADE_AMOUNT} (set via MIN_TRADE_AMOUNT)\n"
         f"• Wallet: {WALLET_ADDRESS[:10]}...{WALLET_ADDRESS[-6:] if WALLET_ADDRESS else 'Not set'}\n"
         f"• AutoTrade: {'✅ ENABLED' if AUTO_TRADE else '❌ DISABLED'}"
     )
@@ -497,6 +497,8 @@ def handle_document(message):
 print(f"Bot starting...")
 print(f"  Slug: {POLYMARKET_SLUG}")
 print(f"  AUTO_TRADE: {AUTO_TRADE}")
-print(f"  TRADE_AMOUNT: ${max(TRADE_AMOUNT, MIN_TRADE_AMOUNT)}")
+print(f"  TRADE_AMOUNT: ${TRADE_AMOUNT}")
+print(f"  MIN_TRADE_AMOUNT: ${MIN_TRADE_AMOUNT}")
+print(f"  Actual trade amount: ${max(TRADE_AMOUNT, MIN_TRADE_AMOUNT)}")
 print(f"  Wallet: {WALLET_ADDRESS[:10]}...{WALLET_ADDRESS[-6:] if WALLET_ADDRESS else 'Not set'}")
 bot.infinity_polling()

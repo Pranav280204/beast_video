@@ -132,34 +132,56 @@ market_mapping = {
 }
 
 def match_market_to_category(question_lower):
-    """Match Polymarket question to bot category using specific-to-general matching"""
+    """Match Polymarket question to bot category with precise matching"""
     
-    # Check for specific phrases first (in order of specificity)
-    specific_matches = [
-        ("beast games", "Beast Games"),
-        ("mystery box", "Mystery Box"),
-        ("world's biggest", "World's Biggest/Largest"),
-        ("world's largest", "World's Biggest/Largest"),
-        ("tesla", "Tesla/Lamborghini"),
-        ("lamborghini", "Tesla/Lamborghini"),
-        ("supercar", "Car/Supercar"),
-        ("helicopter", "Helicopter/Jet"),
-        ("jet", "Helicopter/Jet"),
-    ]
+    # CRITICAL: Check most specific phrases first to avoid false matches
+    # For example, check "beast games" before checking "beast" or "games" alone
     
-    for keyword, category in specific_matches:
-        if keyword in question_lower:
-            return category
+    # Multi-word phrases (must check FIRST)
+    if "beast games" in question_lower:
+        return "Beast Games"
+    if "mystery box" in question_lower:
+        return "Mystery Box"
+    if "world's biggest" in question_lower or "world's largest" in question_lower or "world's largest" in question_lower:
+        return "World's Biggest/Largest"
     
-    # Then check single word matches (order matters!)
-    if "subscribe" in question_lower:
+    # Compound vehicle terms
+    if "tesla" in question_lower or "lamborghini" in question_lower:
+        return "Tesla/Lamborghini"
+    if "helicopter" in question_lower or "jet" in question_lower:
+        return "Helicopter/Jet"
+    
+    # Check for "car" or "supercar" - but NOT if part of other words
+    if "supercar" in question_lower:
+        return "Car/Supercar"
+    # Only match "car" if it's not part of another word
+    if " car " in question_lower or question_lower.startswith("car ") or question_lower.endswith(" car"):
+        return "Car/Supercar"
+    
+    # Thousand/Million - check BEFORE other number words
+    if ("thousand" in question_lower or "million" in question_lower) and ("10+" in question_lower or "10 " in question_lower):
+        return "Thousand/Million"
+    
+    # Dollar - check for "dollar" with threshold context
+    if "dollar" in question_lower and ("10+" in question_lower or "10 " in question_lower):
+        return "Dollar"
+    
+    # Single word matches (order by specificity)
+    # Check Subscribe FIRST (before MrBeast which might match "subscribe")
+    if "subscribe" in question_lower and "mrbeast" not in question_lower:
         return "Subscribe"
-    if "insane" in question_lower:
+    
+    # Check Insane (standalone)
+    if "insane" in question_lower and "mrbeast" not in question_lower:
         return "Insane"
-    if "feastables" in question_lower:
-        return "Feastables"
+    
+    # MrBeast - but only if not already matched above
     if "mrbeast" in question_lower or "mr beast" in question_lower:
         return "MrBeast"
+    
+    # Other single words
+    if "feastables" in question_lower:
+        return "Feastables"
     if "eliminated" in question_lower:
         return "Eliminated"
     if "challenge" in question_lower:
@@ -170,12 +192,6 @@ def match_market_to_category(question_lower):
         return "Island"
     if "trap" in question_lower:
         return "Trap"
-    if "car" in question_lower:  # After supercar check
-        return "Car/Supercar"
-    if "thousand" in question_lower or "million" in question_lower:
-        return "Thousand/Million"
-    if "dollar" in question_lower:
-        return "Dollar"
     
     return None
 
@@ -193,10 +209,11 @@ def get_polymarket_data():
             print("⚠️  No markets found in event!")
             return None, None
         
-        print(f"✅ Found {len(markets)} markets")
+        print(f"✅ Found {len(markets)} markets\n")
         
         prices = {}
         token_ids = {}
+        matched_categories = set()  # Track which categories we've seen
         
         for market in markets:
             question = market.get("question", "")
@@ -206,10 +223,17 @@ def get_polymarket_data():
             matched_cat = match_market_to_category(question_lower)
             
             if not matched_cat:
-                print(f"⚠️  No match for: {question}")
+                print(f"❌ No match: {question}")
                 continue
             
-            print(f"✓ Matched: {question[:60]}... → {matched_cat}")
+            # Check for duplicates
+            if matched_cat in matched_categories:
+                print(f"⚠️  DUPLICATE MATCH for {matched_cat}: {question[:60]}...")
+                print(f"   Skipping duplicate - keeping first match")
+                continue
+            
+            matched_categories.add(matched_cat)
+            print(f"✅ {matched_cat:<25} ← {question[:50]}...")
             
             # Get price
             outcome_prices = market.get("outcome_prices") or market.get("outcomePrices", [])
@@ -222,21 +246,26 @@ def get_polymarket_data():
             if isinstance(outcome_prices, list) and len(outcome_prices) > 0:
                 yes_price = float(outcome_prices[0])
                 prices[matched_cat] = yes_price
-                print(f"  Price: {yes_price:.4f}")
+                print(f"   Price: {yes_price:.4f} ({yes_price*100:.1f}¢)")
+            else:
+                print(f"   ⚠️  NO PRICE DATA")
             
             # Get token ID - Multiple methods
+            token_id = None
+            
+            # Method 1: tokens array
             tokens = market.get("tokens", [])
             if tokens:
                 for token in tokens:
                     if token.get("outcome", "").lower() == "yes":
                         token_id = token.get("token_id")
                         if token_id:
-                            token_ids[matched_cat] = str(token_id)  # Convert to string
-                            print(f"  Token: {str(token_id)}")
+                            token_id = str(token_id)
+                            print(f"   Token: {token_id}")
                             break
             
-            # Fallback: clobTokenIds
-            if matched_cat not in token_ids:
+            # Method 2: clobTokenIds
+            if not token_id:
                 outcomes = market.get("outcomes", [])
                 clob_ids = market.get("clobTokenIds", []) or market.get("clob_token_ids", [])
                 
@@ -255,26 +284,44 @@ def get_polymarket_data():
                 for idx, outcome in enumerate(outcomes):
                     if str(outcome).lower() == "yes":
                         if idx < len(clob_ids):
-                            token_ids[matched_cat] = str(clob_ids[idx])  # Convert to string
-                            print(f"  Token (clobTokenIds): {str(clob_ids[idx])}")
+                            token_id = str(clob_ids[idx])
+                            print(f"   Token: {token_id}")
                         break
             
-            # Last resort: condition_id
-            if matched_cat not in token_ids:
+            # Method 3: condition_id
+            if not token_id:
                 condition_id = market.get("condition_id")
                 if condition_id:
-                    token_ids[matched_cat] = str(condition_id)  # Convert to string
-                    print(f"  Token (condition_id): {str(condition_id)}")
+                    token_id = str(condition_id)
+                    print(f"   Token: {token_id}")
+            
+            # Store data
+            if token_id:
+                token_ids[matched_cat] = token_id
+            else:
+                print(f"   ⚠️  NO TOKEN_ID")
+            
+            print()  # Blank line between markets
         
-        print(f"\n📊 Results: {len(prices)} markets with prices, {len(token_ids)} with token_ids")
+        print(f"📊 Summary: {len(prices)} with prices, {len(token_ids)} with token_ids\n")
         
         # Debug: Show what's missing
-        all_categories = set(prices.keys()) | set(token_ids.keys())
-        for cat in all_categories:
+        all_categories = set(word_groups.keys())
+        found_categories = set(prices.keys()) | set(token_ids.keys())
+        missing_categories = all_categories - found_categories
+        
+        if missing_categories:
+            print(f"⚠️  Categories NOT found in Polymarket:")
+            for cat in sorted(missing_categories):
+                print(f"   - {cat}")
+            print()
+        
+        # Show data issues
+        for cat in found_categories:
             if cat not in prices:
-                print(f"⚠️  {cat}: Missing PRICE")
-            if cat not in token_ids:
-                print(f"⚠️  {cat}: Missing TOKEN_ID")
+                print(f"⚠️  {cat}: Has token_id but NO PRICE")
+            elif cat not in token_ids:
+                print(f"⚠️  {cat}: Has price but NO TOKEN_ID")
         
         return prices, token_ids
         

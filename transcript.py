@@ -103,56 +103,79 @@ thresholds = {
     **{cat: 1 for cat in word_groups if cat not in ["Dollar", "Thousand/Million"]}
 }
 
-# UPDATED: More flexible market mapping to catch variations
+# UPDATED: More specific market mapping to avoid duplicates
 market_mapping = {
-    # Primary keywords (lowercase)
-    "dollar": "Dollar",
-    "thousand": "Thousand/Million",
-    "million": "Thousand/Million",
-    "challenge": "Challenge",
-    "eliminated": "Eliminated",
-    "trap": "Trap",
-    "car": "Car/Supercar",
-    "supercar": "Car/Supercar",
-    "tesla": "Tesla/Lamborghini",
-    "lamborghini": "Tesla/Lamborghini",
-    "helicopter": "Helicopter/Jet",
-    "jet": "Helicopter/Jet",
-    "island": "Island",
-    "mystery box": "Mystery Box",
-    "massive": "Massive",
-    "biggest": "World's Biggest/Largest",
-    "largest": "World's Biggest/Largest",
+    # Order matters - more specific matches first
+    "subscribe": "Subscribe",
+    "insane": "Insane",
     "beast games": "Beast Games",
     "feastables": "Feastables",
     "mrbeast": "MrBeast",
-    "insane": "Insane",
-    "subscribe": "Subscribe"
+    "mr beast": "MrBeast",
+    "mystery box": "Mystery Box",
+    "world's biggest": "World's Biggest/Largest",
+    "world's largest": "World's Biggest/Largest",
+    "tesla": "Tesla/Lamborghini",
+    "lamborghini": "Tesla/Lamborghini",
+    "supercar": "Car/Supercar",
+    "car": "Car/Supercar",
+    "helicopter": "Helicopter/Jet",
+    "jet": "Helicopter/Jet",
+    "thousand": "Thousand/Million",
+    "million": "Thousand/Million",
+    "eliminated": "Eliminated",
+    "challenge": "Challenge",
+    "massive": "Massive",
+    "island": "Island",
+    "dollar": "Dollar",
+    "trap": "Trap",
 }
 
 def match_market_to_category(question_lower):
-    """Match Polymarket question to bot category using flexible matching"""
+    """Match Polymarket question to bot category using specific-to-general matching"""
     
-    # Direct keyword matching
-    for keyword, category in market_mapping.items():
+    # Check for specific phrases first (in order of specificity)
+    specific_matches = [
+        ("beast games", "Beast Games"),
+        ("mystery box", "Mystery Box"),
+        ("world's biggest", "World's Biggest/Largest"),
+        ("world's largest", "World's Biggest/Largest"),
+        ("tesla", "Tesla/Lamborghini"),
+        ("lamborghini", "Tesla/Lamborghini"),
+        ("supercar", "Car/Supercar"),
+        ("helicopter", "Helicopter/Jet"),
+        ("jet", "Helicopter/Jet"),
+    ]
+    
+    for keyword, category in specific_matches:
         if keyword in question_lower:
             return category
     
-    # Special handling for compound terms
-    if "world's biggest" in question_lower or "world's largest" in question_lower:
-        return "World's Biggest/Largest"
-    
-    if ("tesla" in question_lower or "lamborghini" in question_lower):
-        return "Tesla/Lamborghini"
-    
-    if ("car" in question_lower or "supercar" in question_lower):
+    # Then check single word matches (order matters!)
+    if "subscribe" in question_lower:
+        return "Subscribe"
+    if "insane" in question_lower:
+        return "Insane"
+    if "feastables" in question_lower:
+        return "Feastables"
+    if "mrbeast" in question_lower or "mr beast" in question_lower:
+        return "MrBeast"
+    if "eliminated" in question_lower:
+        return "Eliminated"
+    if "challenge" in question_lower:
+        return "Challenge"
+    if "massive" in question_lower:
+        return "Massive"
+    if "island" in question_lower:
+        return "Island"
+    if "trap" in question_lower:
+        return "Trap"
+    if "car" in question_lower:  # After supercar check
         return "Car/Supercar"
-    
-    if ("helicopter" in question_lower or "jet" in question_lower):
-        return "Helicopter/Jet"
-    
-    if ("thousand" in question_lower or "million" in question_lower):
+    if "thousand" in question_lower or "million" in question_lower:
         return "Thousand/Million"
+    if "dollar" in question_lower:
+        return "Dollar"
     
     return None
 
@@ -257,84 +280,57 @@ def format_results(text_lower):
     sorted_counts = dict(sorted(counts.items()))
     total = sum(sorted_counts.values())
     
-    msg = "<pre>"
-    msg += f"{'Category':<30} {'Count':>8}\n"
-    msg += "-" * 40 + "\n"
+    # Compact counts (only show non-zero or meeting threshold)
+    msg = "<b>📊 Word Counts</b>\n<pre>"
     for category, count in sorted_counts.items():
-        msg += f"{category:<30} {count:>8}\n"
-    msg += "-" * 40 + "\n"
-    msg += f"{'TOTAL':<30} {total:>8}\n"
-    msg += "</pre>"
+        thresh = thresholds.get(category, 1)
+        if count >= thresh:
+            msg += f"{category:<20} {count:>3} ✅\n"
+        elif count > 0:
+            msg += f"{category:<20} {count:>3}\n"
+    msg += f"{'─'*25}\nTOTAL: {total}\n</pre>"
 
     prices, token_ids = get_polymarket_data()
-    poly_section = ""
     opportunities = []
-    trade_section = ""
-
+    
+    # Build opportunities list
     if prices:
-        poly_section += "\n<b>📈 Polymarket MrBeast Next Video Markets</b>\n<pre>"
-        poly_section += f"{'Category':<30} {'Count':>6} {'≥Thresh':>9} {'Yes ¢':>8} {'Status':>20}\n"
-        poly_section += "-" * 80 + "\n"
-        
         meets_threshold = 0
-        missing_price = []
-        missing_token = []
+        missing_data = []
         
         for cat, count in sorted_counts.items():
             thresh = thresholds.get(cat, 1)
             yes_p = prices.get(cat)
             token_id = token_ids.get(cat)
-            status = ""
             
-            # Check if meets threshold
             if count >= thresh:
                 meets_threshold += 1
                 
-                if yes_p is None:
-                    status = "⚠️ NO PRICE DATA"
-                    missing_price.append(cat)
-                elif token_id is None:
-                    status = "⚠️ NO TOKEN_ID"
-                    missing_token.append(cat)
-                elif yes_p >= 0.95:
-                    status = f"Too high (≥95¢)"
+                if yes_p is None or token_id is None:
+                    missing_data.append(cat)
                 elif yes_p < 0.95:
-                    edge = (1.0 - yes_p) / yes_p * 100
-                    status = f"SNIPABLE (~{edge:.0f}% edge)"
                     opportunities.append((cat, token_id, yes_p))
-            
-            yes_str = f"{yes_p:.2f}" if yes_p is not None else "N/A"
-            poly_section += f"{cat:<30} {count:>6} {f'≥{thresh}':>9} {yes_str:>8} {status:>20}\n"
         
-        poly_section += "-" * 80 + "\n"
-        poly_section += f"\n<b>📊 SUMMARY:</b>"
-        poly_section += f"\n  Categories meeting threshold: {meets_threshold}"
-        poly_section += f"\n  Tradable opportunities: {len(opportunities)}"
+        # Compact opportunities display
+        poly_section = f"\n<b>🎯 Opportunities: {len(opportunities)}/{meets_threshold}</b>"
         
-        if missing_price:
-            poly_section += f"\n  ⚠️ Missing price data: {len(missing_price)}"
-            poly_section += f"\n     ({', '.join(missing_price[:4])}{'...' if len(missing_price) > 4 else ''})"
-        
-        if missing_token:
-            poly_section += f"\n  ⚠️ Missing token_id: {len(missing_token)}"
-            poly_section += f"\n     ({', '.join(missing_token[:4])}{'...' if len(missing_token) > 4 else ''})"
-
         if opportunities:
-            poly_section += f"\n\n<b>🚨 {len(opportunities)} READY TO TRADE!</b>"
-        elif meets_threshold > 0 and (missing_price or missing_token):
-            poly_section += f"\n\n<b>⚠️ {meets_threshold} opportunities but {len(missing_price) + len(missing_token)} missing data!</b>"
-        elif meets_threshold > 0:
-            poly_section += f"\n\n<b>⚠️ {meets_threshold} opportunities but prices ≥95¢</b>"
-        else:
-            poly_section += "\n\n<b>No opportunities (counts below threshold).</b>"
-        poly_section += "</pre>"
+            poly_section += "\n<pre>"
+            for cat, token_id, yes_p in opportunities:
+                edge = int((1.0 - yes_p) / yes_p * 100)
+                poly_section += f"{cat:<20} {yes_p:.2f} ~{edge}%\n"
+            poly_section += "</pre>"
+        
+        if missing_data:
+            poly_section += f"\n<i>⚠️ {len(missing_data)} missing data: {', '.join(missing_data[:3])}</i>"
     else:
-        poly_section += "\n<i>⚠️ Failed to fetch market data.</i>"
+        poly_section = "\n<i>⚠️ Failed to fetch market data.</i>"
+        opportunities = []
 
-    # Auto-trading - IMPROVED
+    # Trading section (compact)
+    trade_results = []
     if AUTO_TRADE and PRIVATE_KEY and opportunities:
         actual_trade_amt = max(TRADE_AMOUNT, MIN_TRADE_AMOUNT)
-        trade_section += f"\n<b>🤖 AUTO_TRADING ACTIVE (${actual_trade_amt} per opp)</b>"
         
         try:
             pk = PRIVATE_KEY[2:] if PRIVATE_KEY.startswith('0x') else PRIVATE_KEY
@@ -347,93 +343,45 @@ def format_results(text_lower):
             )
             creds = client.create_or_derive_api_creds()
             client.set_api_creds(creds)
-            address = client.get_address()
-            trade_section += f"\nTrading from {address[:8]}...{address[-6:]}"
-            
-            # Check balance
-            try:
-                balance_resp = client.get_balance()
-                usdc_balance = float(balance_resp.get("balance", 0)) / 1e6
-                trade_section += f"\nUSDC Balance: ${usdc_balance:.2f}"
-                
-                if usdc_balance < actual_trade_amt * len(opportunities):
-                    trade_section += f"\n⚠️ Insufficient balance for all {len(opportunities)} trades!"
-            except Exception as e:
-                trade_section += f"\n⚠️ Couldn't check balance: {str(e)[:50]}"
             
             for cat, token_id, yes_p in opportunities:
                 try:
-                    trade_section += f"\n\n📊 {cat}:"
-                    trade_section += f"\n  Token: {token_id[:16]}..."
-                    trade_section += f"\n  Price: {yes_p:.4f} (${yes_p:.2f})"
+                    # Try GTC order
+                    limit_price = min(yes_p * 1.02, 0.99)
+                    shares = actual_trade_amt / limit_price
                     
-                    # Try GTC order with slippage
-                    try:
-                        # 2% slippage tolerance
-                        limit_price = min(yes_p * 1.02, 0.99)
-                        shares = actual_trade_amt / limit_price
-                        
-                        args = OrderArgs(
-                            token_id=token_id,
-                            price=limit_price,
-                            size=shares,
-                            side=BUY,
-                        )
-                        signed = client.create_order(args)
-                        resp = client.post_order(signed, OrderType.GTC)
-                        
-                        order_id = resp.get("order_id") or resp.get("orderID")
-                        if order_id:
-                            trade_section += f"\n  ✅ GTC order: {order_id[:12]}..."
-                            time.sleep(1)
-                            
-                            # Check status
-                            try:
-                                order_status = client.get_order(order_id)
-                                status = order_status.get("status", "unknown")
-                                trade_section += f"\n  Status: {status}"
-                            except:
-                                pass
-                        else:
-                            error_msg = resp.get('error') or resp.get('message', 'Unknown error')
-                            trade_section += f"\n  ⚠️ Order rejected: {error_msg[:60]}"
+                    args = OrderArgs(
+                        token_id=token_id,
+                        price=limit_price,
+                        size=shares,
+                        side=BUY,
+                    )
+                    signed = client.create_order(args)
+                    resp = client.post_order(signed, OrderType.GTC)
                     
-                    except Exception as gtc_error:
-                        error_str = str(gtc_error)[:80]
-                        trade_section += f"\n  ❌ GTC failed: {error_str}"
-                        
-                        # Fallback: FOK with higher amount
-                        try:
-                            trade_section += f"\n  Trying FOK..."
-                            args = MarketOrderArgs(
-                                token_id=token_id,
-                                amount=actual_trade_amt * 2,
-                                side=BUY,
-                                order_type=OrderType.FOK
-                            )
-                            signed = client.create_market_order(args)
-                            resp = client.post_order(signed, OrderType.FOK)
-                            
-                            if "order_id" in resp or resp.get("status") in ["open", "matched"]:
-                                trade_section += f"\n  ✅ FOK filled"
-                            else:
-                                error_msg = resp.get('error') or resp.get('message', 'No fill')
-                                trade_section += f"\n  ❌ FOK: {error_msg[:60]}"
-                        except Exception as fok_error:
-                            trade_section += f"\n  ❌ FOK: {str(fok_error)[:60]}"
+                    order_id = resp.get("order_id") or resp.get("orderID")
+                    if order_id:
+                        trade_results.append(f"✅ {cat[:15]} ${actual_trade_amt}")
+                    else:
+                        error = resp.get('error', 'rejected')[:30]
+                        trade_results.append(f"⚠️ {cat[:15]} {error}")
                 
                 except Exception as e:
-                    trade_section += f"\n❌ {cat} failed: {str(e)[:100]}"
+                    trade_results.append(f"❌ {cat[:15]} {str(e)[:30]}")
         
         except Exception as e:
-            trade_section += f"\n❌ Trading setup failed: {str(e)[:200]}"
+            trade_results.append(f"❌ Setup failed: {str(e)[:50]}")
     
-    elif AUTO_TRADE and not opportunities:
-        trade_section += "\n<i>AUTO_TRADE=true but no opportunities detected.</i>"
-    elif AUTO_TRADE and not PRIVATE_KEY:
-        trade_section += "\n<i>AUTO_TRADE=true but PRIVATE_KEY not set.</i>"
-
-    return f"<b>MrBeast Word Count + Sniper 🚀</b>\n\n{msg}{poly_section}{trade_section}"
+    # Combine results
+    result = f"<b>MrBeast Sniper 🚀</b>\n\n{msg}{poly_section}"
+    
+    if trade_results:
+        result += f"\n\n<b>🤖 Trades (${max(TRADE_AMOUNT, MIN_TRADE_AMOUNT)})</b>\n"
+        result += "\n".join(trade_results[:10])  # Limit to 10 trades shown
+    elif AUTO_TRADE and opportunities:
+        result += "\n\n<i>AUTO_TRADE enabled but no trades executed</i>"
+    
+    return result
 
 # Handlers
 @bot.message_handler(commands=['start', 'help'])

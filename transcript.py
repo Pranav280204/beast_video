@@ -19,7 +19,7 @@ API_TOKEN = os.environ.get("API_TOKEN")
 PRIVATE_KEY = os.environ.get("PRIVATE_KEY")
 WALLET_ADDRESS = os.environ.get("WALLET_ADDRESS")
 AUTO_TRADE = os.environ.get("AUTO_TRADE", "false").lower() == "true"
-TRADE_AMOUNT = float(os.environ.get("TRADE_AMOUNT", "20"))  # USD per opportunity
+TRADE_AMOUNT = float(os.environ.get("TRADE_AMOUNT", "0.25"))  # Lowered default for better fills
 POLYMARKET_SLUG = os.environ.get("POLYMARKET_SLUG", "").strip()
 
 if not BOT_TOKEN:
@@ -74,7 +74,7 @@ def extract_transcript_text(data):
     collect(data)
     return " ".join(text_parts)
 
-# Word groups & thresholds
+# Word groups & thresholds (unchanged)
 word_groups = {
     "Dollar": r"\bdollar(s)?\b",
     "Thousand/Million": r"\b(thousand|million|billion)(s)?\b",
@@ -121,7 +121,7 @@ market_mapping = {
     "subscribe": "Subscribe"
 }
 
-# Polymarket fetch
+# Polymarket fetch (unchanged)
 def get_polymarket_data():
     try:
         url = f"https://gamma-api.polymarket.com/events/slug/{POLYMARKET_SLUG}"
@@ -196,14 +196,16 @@ def format_results(text_lower):
             yes_p = prices.get(cat)
             status = ""
             token_id = token_ids.get(cat)
-            if count >= thresh and yes_p is not None and yes_p < 0.95 and token_id:
-                edge = (1.0 - yes_p) / yes_p * 100
-                status = f"SNIPABLE (~{edge:.0f}% edge)"
+            if count >= thresh and token_id:
+                if yes_p is not None and yes_p > 0:
+                    edge = (1.0 - yes_p) / yes_p * 100
+                    status = f"SNIPABLE (~{edge:.0f}% edge)"
+                else:
+                    status = "SNIPABLE (strong)"
                 opportunities.append((cat, token_id, yes_p))
             yes_str = f"{yes_p:.2f}" if yes_p is not None else "N/A"
             poly_section += f"{cat:<30} {count:>6} {f'≥{thresh}':>9} {yes_str:>8} {status:>20}\n"
         poly_section += "-" * 80 + "\n"
-
         if opportunities:
             poly_section += f"\n<b>🚨 {len(opportunities)} OPPORTUNITIES!</b>"
         else:
@@ -212,7 +214,7 @@ def format_results(text_lower):
     else:
         poly_section += "\n<i>⚠️ Failed to fetch market data.</i>"
 
-    # Auto-trading
+    # Auto-trading - now buys on threshold cross if market matched
     if AUTO_TRADE and PRIVATE_KEY and opportunities:
         trade_section += f"\n<b>🤖 AUTO_TRADING ACTIVE (${TRADE_AMOUNT} per opp)</b>"
         try:
@@ -232,9 +234,9 @@ def format_results(text_lower):
                 try:
                     args = MarketOrderArgs(
                         token_id=token_id,
-                        amount=TRADE_AMOUNT,  # USDC amount
+                        amount=TRADE_AMOUNT,
                         side=BUY,
-                        order_type=OrderType.FOK  # Fill or Kill = market-like
+                        order_type=OrderType.FOK
                     )
                     signed = client.create_market_order(args)
                     resp = client.post_order(signed, OrderType.FOK)
@@ -251,20 +253,22 @@ def format_results(text_lower):
 
     return f"<b>MrBeast Word Count + Sniper 🚀</b>\n\n{msg}{poly_section}{trade_section}"
 
-# Handlers
+# Handlers (unchanged except welcome note)
 @bot.message_handler(commands=['start', 'help'])
 def send_welcome(message):
     welcome_text = (
         "<b>MrBeast Word Counter + Polymarket Sniper Bot! 👋</b>\n\n"
         "Send YouTube URL/ID, transcript text, or .txt file.\n\n"
-        f"Market: {POLYMARKET_SLUG}\n"
-        "• Fixed thresholds (Dollar & Thousand/Million: 10+, others: 1+)\n"
-        "• Live Yes prices\n"
-        f"• Auto market-buy Yes shares (${TRADE_AMOUNT} per opp if AUTO_TRADE=true)\n\n"
+        f"Current market slug: {POLYMARKET_SLUG or 'Not set'}\n"
+        "• Buys Yes on threshold cross (if market matched)\n"
+        "• Ignores N/A categories\n"
+        f"• Auto market-buy (${TRADE_AMOUNT} per opp if AUTO_TRADE=true)\n"
+        "• Lower TRADE_AMOUNT (e.g. 0.25) for better fill rates!\n\n"
         f"Wallet: {WALLET_ADDRESS or 'Not set'} | AutoTrade: {AUTO_TRADE}"
     )
     bot.reply_to(message, welcome_text, parse_mode='HTML')
 
+# Rest of handlers unchanged...
 @bot.message_handler(content_types=['text'])
 def handle_text(message):
     user_text = message.text.strip()

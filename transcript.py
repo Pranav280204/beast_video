@@ -435,15 +435,16 @@ def format_results(text_lower):
                     signed = client.create_market_order(args)
                     
                     print(f"   Posting order...")
-                    resp = client.post_order(signed, OrderType.FOK)
+                    resp = client.post_order(signed, OrderType.FOK)  # FOK = Fill or Kill (immediate)
                     
                     print(f"   Response: {resp}")
                     
                     order_id = resp.get("order_id") or resp.get("orderID")
                     success = resp.get("success", False)
+                    status = resp.get("status", "")
                     
-                    if order_id or success:
-                        print(f"   ✅ Success!")
+                    if order_id or success or status in ["matched", "live", "open"]:
+                        print(f"   ✅ Success! Status: {status}")
                         trade_results.append(f"✅ {cat[:15]} ${actual_trade_amt}")
                         time.sleep(0.5)  # Rate limit pause
                     else:

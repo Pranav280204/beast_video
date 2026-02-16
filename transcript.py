@@ -25,7 +25,6 @@ POLYMARKET_SLUG = os.environ.get("POLYMARKET_SLUG", "").strip()
 if not BOT_TOKEN:
     print("ERROR: BOT_TOKEN not set!")
     exit(1)
-
 if not POLYMARKET_SLUG:
     print("ERROR: POLYMARKET_SLUG not set!")
     exit(1)
@@ -129,14 +128,11 @@ def get_polymarket_data():
         response = requests.get(url, timeout=15)
         response.raise_for_status()
         event = response.json()
-
         markets = event.get("markets", [])
         if not markets:
             return None, None
-
         prices = {}
         token_ids = {}
-
         for market in markets:
             question_lower = market.get("question", "").lower()
             matched_cat = None
@@ -144,7 +140,6 @@ def get_polymarket_data():
                 if keyword in question_lower:
                     matched_cat = cat
                     break
-
             if matched_cat:
                 outcome_prices = market.get("outcome_prices") or market.get("outcomePrices", [])
                 if isinstance(outcome_prices, str):
@@ -152,14 +147,12 @@ def get_polymarket_data():
                 if isinstance(outcome_prices, list) and len(outcome_prices) > 0:
                     yes_price = float(outcome_prices[0])
                     prices[matched_cat] = yes_price
-
                 tokens = market.get("tokens", [])
                 if tokens:
                     for token in tokens:
                         if token.get("outcome", "").lower() == "yes":
                             token_ids[matched_cat] = token.get("token_id")
                             break
-
                 if matched_cat not in token_ids:
                     outcomes = market.get("outcomes", [])
                     clob_ids = market.get("clobTokenIds", []) or market.get("clob_token_ids", [])
@@ -171,9 +164,7 @@ def get_polymarket_data():
                         idx = [str(o).lower() for o in outcomes].index("yes")
                         if idx < len(clob_ids):
                             token_ids[matched_cat] = clob_ids[idx]
-
         return prices, token_ids
-
     except Exception as e:
         print(f"Polymarket fetch error: {e}")
         return None, None
@@ -182,7 +173,6 @@ def format_results(text_lower):
     counts = {cat: len(re.findall(pattern, text_lower)) for cat, pattern in word_groups.items()}
     sorted_counts = dict(sorted(counts.items()))
     total = sum(sorted_counts.values())
-
     msg = "<pre>"
     msg += f"{'Category':<30} {'Count':>8}\n"
     msg += "-" * 40 + "\n"
@@ -201,7 +191,6 @@ def format_results(text_lower):
         poly_section += "\n<b>📈 Polymarket MrBeast Next Video Markets</b>\n<pre>"
         poly_section += f"{'Category':<30} {'Count':>6} {'≥Thresh':>9} {'Yes ¢':>8} {'Status':>20}\n"
         poly_section += "-" * 80 + "\n"
-
         for cat, count in sorted_counts.items():
             thresh = thresholds.get(cat, 1)
             yes_p = prices.get(cat)
@@ -211,20 +200,19 @@ def format_results(text_lower):
                 edge = (1.0 - yes_p) / yes_p * 100
                 status = f"SNIPABLE (~{edge:.0f}% edge)"
                 opportunities.append((cat, token_id, yes_p))
-
             yes_str = f"{yes_p:.2f}" if yes_p is not None else "N/A"
             poly_section += f"{cat:<30} {count:>6} {f'≥{thresh}':>9} {yes_str:>8} {status:>20}\n"
-
         poly_section += "-" * 80 + "\n"
+
         if opportunities:
             poly_section += f"\n<b>🚨 {len(opportunities)} OPPORTUNITIES!</b>"
         else:
-           26            poly_section += "\nNo strong edges."
+            poly_section += "\n<b>No strong edges.</b>"
         poly_section += "</pre>"
     else:
         poly_section += "\n<i>⚠️ Failed to fetch market data.</i>"
 
-    # Auto-trading with TRUE MARKET ORDERS
+    # Auto-trading
     if AUTO_TRADE and PRIVATE_KEY and opportunities:
         trade_section += f"\n<b>🤖 AUTO_TRADING ACTIVE (${TRADE_AMOUNT} per opp)</b>"
         try:
@@ -238,10 +226,8 @@ def format_results(text_lower):
             )
             creds = client.create_or_derive_api_creds()
             client.set_api_creds(creds)
-
             address = client.get_address()
             trade_section += f"\nTrading from {address[:8]}..."
-
             for cat, token_id, yes_p in opportunities:
                 try:
                     args = MarketOrderArgs(
@@ -260,14 +246,12 @@ def format_results(text_lower):
                     trade_section += f"\n❌ {cat} error: {str(e)[:80]}"
         except Exception as e:
             trade_section += f"\n❌ Trading setup failed: {str(e)[:150]}"
-    elif AUTO_TRADE and PRIVATE_KEY and opportunities:
-        trade_section += "\n<i>⚠️ Some opportunities missing token_id – no trade.</i>"
     elif AUTO_TRADE:
         trade_section += "\n<i>AUTO_TRADE=true but no PRIVATE_KEY or no opportunities.</i>"
 
     return f"<b>MrBeast Word Count + Sniper 🚀</b>\n\n{msg}{poly_section}{trade_section}"
 
-# Handlers remain the same
+# Handlers
 @bot.message_handler(commands=['start', 'help'])
 def send_welcome(message):
     welcome_text = (
@@ -286,9 +270,7 @@ def handle_text(message):
     user_text = message.text.strip()
     if not user_text:
         return
-
     video_id = extract_video_id(user_text)
-
     if video_id and API_TOKEN:
         bot.reply_to(message, "🔄 Fetching transcript...")
         try:
@@ -306,7 +288,6 @@ def handle_text(message):
             return
     else:
         raw_text = user_text
-
     result_msg = format_results(raw_text.lower())
     bot.send_message(message.chat.id, result_msg, parse_mode='HTML')
 
@@ -316,7 +297,6 @@ def handle_document(message):
     if not (doc.mime_type == 'text/plain' or doc.file_name.lower().endswith('.txt')):
         bot.reply_to(message, "Send .txt file only.")
         return
-
     bot.reply_to(message, "📄 Processing...")
     try:
         file_info = bot.get_file(doc.file_id)

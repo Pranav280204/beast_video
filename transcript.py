@@ -422,67 +422,54 @@ def format_results(text_lower):
                     print(f"\n📊 Trading {cat}:")
                     print(f"   Token: {token_id}")
                     print(f"   Price: {yes_p:.4f}")
+                    print(f"   Amount: ${actual_trade_amt}")
                     
-                    # Calculate order parameters
-                    shares = actual_trade_amt / yes_p
-                    limit_price = min(yes_p * 1.05, 0.99)  # 5% slippage (increased from 2%)
-                    
-                    print(f"   Shares: {shares:.4f}")
-                    print(f"   Limit: {limit_price:.4f}")
-                    
-                    # Create order
-                    args = OrderArgs(
+                    # Use market order with USD amount (simple!)
+                    args = MarketOrderArgs(
                         token_id=token_id,
-                        price=limit_price,
-                        size=shares,
+                        amount=actual_trade_amt,  # USD amount
                         side=BUY,
                     )
                     
-                    print(f"   Creating order...")
-                    signed = client.create_order(args)
+                    print(f"   Creating market order...")
+                    signed = client.create_market_order(args)
                     
                     print(f"   Posting order...")
-                    resp = client.post_order(signed, OrderType.GTC)
+                    resp = client.post_order(signed, OrderType.FOK)
                     
                     print(f"   Response: {resp}")
                     
                     order_id = resp.get("order_id") or resp.get("orderID")
-                    if order_id:
-                        print(f"   ✅ Success! Order ID: {order_id[:12]}...")
+                    success = resp.get("success", False)
+                    
+                    if order_id or success:
+                        print(f"   ✅ Success!")
                         trade_results.append(f"✅ {cat[:15]} ${actual_trade_amt}")
                         time.sleep(0.5)  # Rate limit pause
                     else:
-                        error = resp.get('error') or resp.get('message', 'Unknown')
-                        print(f"   ⚠️  Order rejected: {error}")
-                        trade_results.append(f"⚠️ {cat[:15]} {str(error)[:20]}")
+                        error = resp.get('error') or resp.get('errorMsg') or resp.get('message', 'No fill')
+                        print(f"   ⚠️  Order failed: {error}")
+                        trade_results.append(f"⚠️ {cat[:15]} No fill")
                 
                 except Exception as e:
                     error_str = str(e)
                     print(f"   ❌ Error: {error_str}")
                     
                     # Parse common errors
-                    if "status_code=400" in error_str or "status_code=4" in error_str:
+                    if "status_code=400" in error_str:
                         if "insufficient" in error_str.lower():
                             trade_results.append(f"❌ {cat[:15]} Low balance")
-                        elif "invalid" in error_str.lower():
-                            trade_results.append(f"❌ {cat[:15]} Bad token_id")
-                        elif "size" in error_str.lower():
-                            trade_results.append(f"❌ {cat[:15]} Bad size")
                         else:
                             trade_results.append(f"❌ {cat[:15]} API error")
                     else:
-                        trade_results.append(f"❌ {cat[:15]} {error_str[:20]}")
+                        trade_results.append(f"❌ {cat[:15]} Error")
                     
-                    # Continue to next trade
                     time.sleep(0.5)
         
         except Exception as e:
             error_msg = str(e)
             print(f"\n❌ Trading setup failed: {error_msg}")
             trade_results.append(f"❌ Setup: {error_msg[:30]}")
-        
-        except Exception as e:
-            trade_results.append(f"❌ Setup failed: {str(e)[:50]}")
     
     # Combine results
     result = f"<b>MrBeast Sniper 🚀</b>\n\n{msg}{poly_section}"

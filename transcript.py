@@ -16,10 +16,13 @@ if os.environ.get("AUTO_TRADE", "false").lower() == "true":
 # Environment variables
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 API_TOKEN = os.environ.get("API_TOKEN")
-PRIVATE_KEY = os.environ.get("PRIVATE_KEY")
+PRIVATE_KEY = os.environ.get
+
+("PRIVATE_KEY")
 WALLET_ADDRESS = os.environ.get("WALLET_ADDRESS")
 AUTO_TRADE = os.environ.get("AUTO_TRADE", "false").lower() == "true"
-TRADE_AMOUNT = float(os.environ.get("TRADE_AMOUNT", "0.25"))  # Lowered default for better fills
+TRADE_AMOUNT = float(os.environ.get("TRADE_AMOUNT", "1.0"))  # Starting USD per opportunity
+MIN_TRADE_AMOUNT = 0.05  # Minimum to attempt (below this, give up)
 POLYMARKET_SLUG = os.environ.get("POLYMARKET_SLUG", "").strip()
 
 if not BOT_TOKEN:
@@ -74,7 +77,7 @@ def extract_transcript_text(data):
     collect(data)
     return " ".join(text_parts)
 
-# Word groups & thresholds (unchanged)
+# Word groups & thresholds
 word_groups = {
     "Dollar": r"\bdollar(s)?\b",
     "Thousand/Million": r"\b(thousand|million|billion)(s)?\b",
@@ -121,7 +124,7 @@ market_mapping = {
     "subscribe": "Subscribe"
 }
 
-# Polymarket fetch (unchanged)
+# Polymarket fetch
 def get_polymarket_data():
     try:
         url = f"https://gamma-api.polymarket.com/events/slug/{POLYMARKET_SLUG}"
@@ -141,12 +144,15 @@ def get_polymarket_data():
                     matched_cat = cat
                     break
             if matched_cat:
+                # Price
                 outcome_prices = market.get("outcome_prices") or market.get("outcomePrices", [])
                 if isinstance(outcome_prices, str):
                     outcome_prices = json.loads(outcome_prices)
                 if isinstance(outcome_prices, list) and len(outcome_prices) > 0:
                     yes_price = float(outcome_prices[0])
                     prices[matched_cat] = yes_price
+
+                # Token ID (independent of price)
                 tokens = market.get("tokens", [])
                 if tokens:
                     for token in tokens:
@@ -160,8 +166,9 @@ def get_polymarket_data():
                         outcomes = json.loads(outcomes)
                     if isinstance(clob_ids, str):
                         clob_ids = json.loads(clob_ids)
-                    if "yes" in [str(o).lower() for o in outcomes]:
-                        idx = [str(o).lower() for o in outcomes].index("yes")
+                    lower_outcomes = [str(o).lower() for o in outcomes]
+                    if "yes" in lower_outcomes:
+                        idx = lower_outcomes.index("yes")
                         if idx < len(clob_ids):
                             token_ids[matched_cat] = clob_ids[idx]
         return prices, token_ids
@@ -187,25 +194,28 @@ def format_results(text_lower):
     opportunities = []
     trade_section = ""
 
-    if prices:
+    if prices or unele token_ids:
         poly_section += "\n<b>📈 Polymarket MrBeast Next Video Markets</b>\n<pre>"
-        poly_section += f"{'Category':<30} {'Count':>6} {'≥Thresh':>9} {'Yes ¢':>8} {'Status':>20}\n"
-        poly_section += "-" * 80 + "\n"
+        poly_section += f"{'Category':<30} {'Count':>6} {'≥Thresh':>9} {'Yes ¢':>8} {'Status':>30}\n"
+        poly_section += "-" * 90 + "\n"
         for cat, count in sorted_counts.items():
             thresh = thresholds.get(cat, 1)
             yes_p = prices.get(cat)
-            status = ""
             token_id = token_ids.get(cat)
+            status = ""
             if count >= thresh and token_id:
+                status = "SNIPABLE"
                 if yes_p is not None and yes_p > 0:
                     edge = (1.0 - yes_p) / yes_p * 100
-                    status = f"SNIPABLE (~{edge:.0f}% edge)"
+                    status += f" (~{edge:.0f}% edge)"
+                elif yes_p is not None and yes_p == 0:
+                    status += " (infinite edge)"
                 else:
-                    status = "SNIPABLE (strong)"
+                    status += " (blind buy)"
                 opportunities.append((cat, token_id, yes_p))
             yes_str = f"{yes_p:.2f}" if yes_p is not None else "N/A"
-            poly_section += f"{cat:<30} {count:>6} {f'≥{thresh}':>9} {yes_str:>8} {status:>20}\n"
-        poly_section += "-" * 80 + "\n"
+            poly_section += f"{cat:<30} {count:>6} {f'≥{thresh}' if count >= thresh else '':>9} {yes_str:>8} {status:>30}\n"
+        poly_section += "-" * 90 + "\n"
         if opportunities:
             poly_section += f"\n<b>🚨 {len(opportunities)} OPPORTUNITIES!</b>"
         else:
@@ -214,9 +224,9 @@ def format_results(text_lower):
     else:
         poly_section += "\n<i>⚠️ Failed to fetch market data.</i>"
 
-    # Auto-trading - now buys on threshold cross if market matched
+    # Auto-trading with retry on smaller amounts for low liquidity
     if AUTO_TRADE and PRIVATE_KEY and opportunities:
-        trade_section += f"\n<b>🤖 AUTO_TRADING ACTIVE (${TRADE_AMOUNT} per opp)</b>"
+        trade_section += f"\n<b>🤖 AUTO_TRADING ACTIVE (start ${TRADE_AMOUNT}, min ${MIN_TRADE_AMOUNT})</b>"
         try:
             pk = PRIVATE_KEY[2:] if PRIVATE_KEY.startswith('0x') else PRIVATE_KEY
             client = ClobClient(
@@ -231,21 +241,29 @@ def format_results(text_lower):
             address = client.get_address()
             trade_section += f"\nTrading from {address[:8]}..."
             for cat, token_id, yes_p in opportunities:
-                try:
-                    args = MarketOrderArgs(
-                        token_id=token_id,
-                        amount=TRADE_AMOUNT,
-                        side=BUY,
-                        order_type=OrderType.FOK
-                    )
-                    signed = client.create_market_order(args)
-                    resp = client.post_order(signed, OrderType.FOK)
-                    if "order_id" in resp or resp.get("status") == "open":
-                        trade_section += f"\n✅ Bought {cat} Yes (~${TRADE_AMOUNT})"
-                    else:
-                        trade_section += f"\n⚠️ {cat} failed: {resp.get('message', 'No fill')}"
-                except Exception as e:
-                    trade_section += f"\n❌ {cat} error: {str(e)[:80]}"
+                current_amount = TRADE_AMOUNT
+                bought = False
+                while current_amount >= MIN_TRADE_AMOUNT and not bought:
+                    try:
+                        args = MarketOrderArgs(
+                            token_id=token_id,
+                            amount=current_amount,
+                            side=BUY,
+                            order_type=OrderType.FOK
+                        )
+                        signed = client.create_market_order(args)
+                        resp = client.post_order(signed, OrderType.FOK)
+                        if resp.get("order_id") or resp.get("status") in ["open", "filled"]:
+                            trade_section += f"\n✅ Bought {cat} Yes (~${current_amount:.2f})"
+                            bought = True
+                        else:
+                            trade_section += f"\n⚠️ {cat} no fill at ${current_amount:.2f}, retrying half..."
+                            current_amount /= 2
+                    except Exception as e:
+                        trade_section += f"\n❌ {cat} error: {str(e)[:80]}"
+                        break
+                if not bought:
+                    trade_section += f"\n⚠️ {cat} failed (even at ${MIN_TRADE_AMOUNT})"
         except Exception as e:
             trade_section += f"\n❌ Trading setup failed: {str(e)[:150]}"
     elif AUTO_TRADE:
@@ -253,22 +271,20 @@ def format_results(text_lower):
 
     return f"<b>MrBeast Word Count + Sniper 🚀</b>\n\n{msg}{poly_section}{trade_section}"
 
-# Handlers (unchanged except welcome note)
+# Handlers (unchanged)
 @bot.message_handler(commands=['start', 'help'])
 def send_welcome(message):
     welcome_text = (
         "<b>MrBeast Word Counter + Polymarket Sniper Bot! 👋</b>\n\n"
         "Send YouTube URL/ID, transcript text, or .txt file.\n\n"
-        f"Current market slug: {POLYMARKET_SLUG or 'Not set'}\n"
-        "• Buys Yes on threshold cross (if market matched)\n"
-        "• Ignores N/A categories\n"
-        f"• Auto market-buy (${TRADE_AMOUNT} per opp if AUTO_TRADE=true)\n"
-        "• Lower TRADE_AMOUNT (e.g. 0.25) for better fill rates!\n\n"
+        f"Market: {POLYMARKET_SLUG}\n"
+        "• Fixed thresholds (Dollar & Thousand/Million: 10+, others: 1+)\n"
+        "• Live Yes prices\n"
+        f"• Auto market-buy Yes shares (starts at ${TRADE_AMOUNT}, halves on no-fill down to ${MIN_TRADE_AMOUNT})\n\n"
         f"Wallet: {WALLET_ADDRESS or 'Not set'} | AutoTrade: {AUTO_TRADE}"
     )
     bot.reply_to(message, welcome_text, parse_mode='HTML')
 
-# Rest of handlers unchanged...
 @bot.message_handler(content_types=['text'])
 def handle_text(message):
     user_text = message.text.strip()

@@ -132,65 +132,66 @@ market_mapping = {
 }
 
 def match_market_to_category(question_lower):
-    """Match Polymarket question to bot category with precise matching"""
+    """Match Polymarket question to bot category by finding the quoted word/phrase"""
     
-    # CRITICAL: Check most specific phrases first to avoid false matches
-    # For example, check "beast games" before checking "beast" or "games" alone
+    # Strategy: Extract what word is being asked about (usually in quotes)
+    # Example: 'Will MrBeast say "Dollar" 10+ times' -> look for "dollar"
     
-    # Multi-word phrases (must check FIRST)
-    if "beast games" in question_lower:
+    # Multi-word phrases (check these first as they're most specific)
+    if '"beast games"' in question_lower or "'beast games'" in question_lower or "beast games" in question_lower:
         return "Beast Games"
-    if "mystery box" in question_lower:
+    
+    if '"mystery box"' in question_lower or "'mystery box'" in question_lower or "mystery box" in question_lower:
         return "Mystery Box"
-    if "world's biggest" in question_lower or "world's largest" in question_lower or "world's largest" in question_lower:
+    
+    if ('"world\'s biggest"' in question_lower or '"world\'s largest"' in question_lower or 
+        "world's biggest" in question_lower or "world's largest" in question_lower):
         return "World's Biggest/Largest"
     
-    # Compound vehicle terms
-    if "tesla" in question_lower or "lamborghini" in question_lower:
+    # Two-word vehicle phrases
+    if '"tesla"' in question_lower or '"lamborghini"' in question_lower or ("tesla" in question_lower and "lamborghini" in question_lower):
         return "Tesla/Lamborghini"
-    if "helicopter" in question_lower or "jet" in question_lower:
+    
+    if '"helicopter"' in question_lower or '"jet"' in question_lower or ("helicopter" in question_lower and "jet" in question_lower):
         return "Helicopter/Jet"
     
-    # Check for "car" or "supercar" - but NOT if part of other words
-    if "supercar" in question_lower:
-        return "Car/Supercar"
-    # Only match "car" if it's not part of another word
-    if " car " in question_lower or question_lower.startswith("car ") or question_lower.endswith(" car"):
+    if '"car"' in question_lower or '"supercar"' in question_lower or ("car" in question_lower and "supercar" in question_lower):
         return "Car/Supercar"
     
-    # Thousand/Million - check BEFORE other number words
-    if ("thousand" in question_lower or "million" in question_lower) and ("10+" in question_lower or "10 " in question_lower):
+    # Number words with 10+ context
+    if ('"thousand"' in question_lower or '"million"' in question_lower) and "10+" in question_lower:
         return "Thousand/Million"
     
-    # Dollar - check for "dollar" with threshold context
-    if "dollar" in question_lower and ("10+" in question_lower or "10 " in question_lower):
+    # Dollar with 10+ context
+    if '"dollar"' in question_lower and "10+" in question_lower:
         return "Dollar"
     
-    # Single word matches (order by specificity)
-    # Check Subscribe FIRST (before MrBeast which might match "subscribe")
-    if "subscribe" in question_lower and "mrbeast" not in question_lower:
+    # Single word checks - look for the word in quotes
+    if '"subscribe"' in question_lower:
         return "Subscribe"
     
-    # Check Insane (standalone)
-    if "insane" in question_lower and "mrbeast" not in question_lower:
+    if '"insane"' in question_lower:
         return "Insane"
     
-    # MrBeast - but only if not already matched above
-    if "mrbeast" in question_lower or "mr beast" in question_lower:
+    if '"feastables"' in question_lower:
+        return "Feastables"
+    
+    if '"mrbeast"' in question_lower or '"mr beast"' in question_lower:
         return "MrBeast"
     
-    # Other single words
-    if "feastables" in question_lower:
-        return "Feastables"
-    if "eliminated" in question_lower:
+    if '"eliminated"' in question_lower:
         return "Eliminated"
-    if "challenge" in question_lower:
+    
+    if '"challenge"' in question_lower:
         return "Challenge"
-    if "massive" in question_lower:
+    
+    if '"massive"' in question_lower:
         return "Massive"
-    if "island" in question_lower:
+    
+    if '"island"' in question_lower:
         return "Island"
-    if "trap" in question_lower:
+    
+    if '"trap"' in question_lower:
         return "Trap"
     
     return None

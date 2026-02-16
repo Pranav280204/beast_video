@@ -231,8 +231,8 @@ def get_polymarket_data():
                     if token.get("outcome", "").lower() == "yes":
                         token_id = token.get("token_id")
                         if token_id:
-                            token_ids[matched_cat] = token_id
-                            print(f"  Token: {token_id[:20]}...")
+                            token_ids[matched_cat] = str(token_id)  # Convert to string
+                            print(f"  Token: {str(token_id)}")
                             break
             
             # Fallback: clobTokenIds
@@ -255,18 +255,27 @@ def get_polymarket_data():
                 for idx, outcome in enumerate(outcomes):
                     if str(outcome).lower() == "yes":
                         if idx < len(clob_ids):
-                            token_ids[matched_cat] = clob_ids[idx]
-                            print(f"  Token (from clobTokenIds): {clob_ids[idx][:20]}...")
+                            token_ids[matched_cat] = str(clob_ids[idx])  # Convert to string
+                            print(f"  Token (clobTokenIds): {str(clob_ids[idx])}")
                         break
             
             # Last resort: condition_id
             if matched_cat not in token_ids:
                 condition_id = market.get("condition_id")
                 if condition_id:
-                    token_ids[matched_cat] = condition_id
-                    print(f"  Token (from condition_id): {condition_id[:20]}...")
+                    token_ids[matched_cat] = str(condition_id)  # Convert to string
+                    print(f"  Token (condition_id): {str(condition_id)}")
         
         print(f"\n📊 Results: {len(prices)} markets with prices, {len(token_ids)} with token_ids")
+        
+        # Debug: Show what's missing
+        all_categories = set(prices.keys()) | set(token_ids.keys())
+        for cat in all_categories:
+            if cat not in prices:
+                print(f"⚠️  {cat}: Missing PRICE")
+            if cat not in token_ids:
+                print(f"⚠️  {cat}: Missing TOKEN_ID")
+        
         return prices, token_ids
         
     except Exception as e:
@@ -344,32 +353,85 @@ def format_results(text_lower):
             creds = client.create_or_derive_api_creds()
             client.set_api_creds(creds)
             
+            # Log client info
+            address = client.get_address()
+            print(f"\n🔑 Trading wallet: {address}")
+            
+            # Check balance
+            try:
+                balance_resp = client.get_balance()
+                usdc_balance = float(balance_resp.get("balance", 0)) / 1e6
+                print(f"💰 USDC Balance: ${usdc_balance:.2f}")
+                
+                if usdc_balance < actual_trade_amt * len(opportunities):
+                    print(f"⚠️  Insufficient balance! Need ${actual_trade_amt * len(opportunities):.2f}, have ${usdc_balance:.2f}")
+                    trade_results.append(f"⚠️ Low balance: ${usdc_balance:.2f}")
+            except Exception as e:
+                print(f"⚠️  Balance check failed: {e}")
+            
             for cat, token_id, yes_p in opportunities:
                 try:
-                    # Calculate order parameters
-                    # For $1 trade at 50¢: we want exactly 2 shares
-                    # Use current price for size calculation, add slippage to limit price
-                    shares = actual_trade_amt / yes_p  # Exact shares for desired USD amount
-                    limit_price = min(yes_p * 1.02, 0.99)  # Allow 2% slippage for fill
+                    print(f"\n📊 Trading {cat}:")
+                    print(f"   Token: {token_id}")
+                    print(f"   Price: {yes_p:.4f}")
                     
+                    # Calculate order parameters
+                    shares = actual_trade_amt / yes_p
+                    limit_price = min(yes_p * 1.05, 0.99)  # 5% slippage (increased from 2%)
+                    
+                    print(f"   Shares: {shares:.4f}")
+                    print(f"   Limit: {limit_price:.4f}")
+                    
+                    # Create order
                     args = OrderArgs(
                         token_id=token_id,
-                        price=limit_price,  # Max price we'll pay per share
-                        size=shares,  # Number of shares (based on current price)
+                        price=limit_price,
+                        size=shares,
                         side=BUY,
                     )
+                    
+                    print(f"   Creating order...")
                     signed = client.create_order(args)
+                    
+                    print(f"   Posting order...")
                     resp = client.post_order(signed, OrderType.GTC)
+                    
+                    print(f"   Response: {resp}")
                     
                     order_id = resp.get("order_id") or resp.get("orderID")
                     if order_id:
+                        print(f"   ✅ Success! Order ID: {order_id[:12]}...")
                         trade_results.append(f"✅ {cat[:15]} ${actual_trade_amt}")
+                        time.sleep(0.5)  # Rate limit pause
                     else:
-                        error = resp.get('error', 'rejected')[:30]
-                        trade_results.append(f"⚠️ {cat[:15]} {error}")
+                        error = resp.get('error') or resp.get('message', 'Unknown')
+                        print(f"   ⚠️  Order rejected: {error}")
+                        trade_results.append(f"⚠️ {cat[:15]} {str(error)[:20]}")
                 
                 except Exception as e:
-                    trade_results.append(f"❌ {cat[:15]} {str(e)[:30]}")
+                    error_str = str(e)
+                    print(f"   ❌ Error: {error_str}")
+                    
+                    # Parse common errors
+                    if "status_code=400" in error_str or "status_code=4" in error_str:
+                        if "insufficient" in error_str.lower():
+                            trade_results.append(f"❌ {cat[:15]} Low balance")
+                        elif "invalid" in error_str.lower():
+                            trade_results.append(f"❌ {cat[:15]} Bad token_id")
+                        elif "size" in error_str.lower():
+                            trade_results.append(f"❌ {cat[:15]} Bad size")
+                        else:
+                            trade_results.append(f"❌ {cat[:15]} API error")
+                    else:
+                        trade_results.append(f"❌ {cat[:15]} {error_str[:20]}")
+                    
+                    # Continue to next trade
+                    time.sleep(0.5)
+        
+        except Exception as e:
+            error_msg = str(e)
+            print(f"\n❌ Trading setup failed: {error_msg}")
+            trade_results.append(f"❌ Setup: {error_msg[:30]}")
         
         except Exception as e:
             trade_results.append(f"❌ Setup failed: {str(e)[:50]}")

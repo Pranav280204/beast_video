@@ -48,10 +48,8 @@ if PRIVATE_KEY and not WALLET_ADDRESS:
 
 # Video ID extraction
 def extract_video_id(user_input):
-    patterns = [
-        r'(?:v=|\/embed\/|\/shorts\/|\/watch\?v=|youtu\.be\/)([0-9A-Za-z_-]{11})',
-        r'^([0-9A-Za-z_-]{11})$'
-    ]
+    patterns = [r'(?:v=|\/embed\/|\/shorts\/|\/watch\?v=|youtu\.be\/)([0-9A-Za-z_-]{11})',
+        r'^([0-9A-Za-z_-]{11})$']
     for pattern in patterns:
         match = re.search(pattern, user_input)
         if match:
@@ -106,56 +104,39 @@ thresholds = {
 def match_market_to_category(question_lower):
     if '"beast games"' in question_lower or "'beast games'" in question_lower or "beast games" in question_lower:
         return "Beast Games"
-    
     if '"mystery box"' in question_lower or "'mystery box'" in question_lower or "mystery box" in question_lower:
         return "Mystery Box"
-    
     if ('"world\'s biggest"' in question_lower or '"world\'s largest"' in question_lower or 
         "world's biggest" in question_lower or "world's largest" in question_lower):
         return "World's Biggest/Largest"
-    
     if '"tesla"' in question_lower or '"lamborghini"' in question_lower or ("tesla" in question_lower and "lamborghini" in question_lower):
         return "Tesla/Lamborghini"
-    
     if '"helicopter"' in question_lower or '"jet"' in question_lower or ("helicopter" in question_lower and "jet" in question_lower):
         return "Helicopter/Jet"
-    
     if '"car"' in question_lower or '"supercar"' in question_lower or ("car" in question_lower and "supercar" in question_lower):
         return "Car/Supercar"
-    
     if ('"thousand"' in question_lower or '"million"' in question_lower) and "10+" in question_lower:
         return "Thousand/Million"
-    
     if '"dollar"' in question_lower and "10+" in question_lower:
         return "Dollar"
-    
     if '"subscribe"' in question_lower:
         return "Subscribe"
-    
     if '"insane"' in question_lower:
         return "Insane"
-    
     if '"feastables"' in question_lower:
         return "Feastables"
-    
     if '"mrbeast"' in question_lower or '"mr beast"' in question_lower:
         return "MrBeast"
-    
     if '"eliminated"' in question_lower:
         return "Eliminated"
-    
     if '"challenge"' in question_lower:
         return "Challenge"
-    
     if '"massive"' in question_lower:
         return "Massive"
-    
     if '"island"' in question_lower:
         return "Island"
-    
     if '"trap"' in question_lower:
         return "Trap"
-    
     return None
 
 def get_token_id_for_outcome(market, target_outcome):
@@ -240,7 +221,7 @@ def get_polymarket_data():
             yes_price = None
             if isinstance(outcome_prices, list) and len(outcome_prices) > 0:
                 yes_price = float(outcome_prices[0])
-                print(f"   Yes Price: {yes_price:.4f} ({yes_price*100 coordinators:.1f}¢)")
+                print(f"   Yes Price: {yes_price:.4f} ({yes_price*100:.1f}¢)")
             else:
                 print(f"   ⚠️  NO PRICE DATA")
             
@@ -299,8 +280,6 @@ def format_results(text_lower):
             msg += f"{category:<20} {count:>3} ✅\n"
         elif count > 0:
             msg += f"{category:<20} {count:>3} ❌\n"
-        else:
-            msg += f"{category:<20} {count:>3}\n"
     msg += f"{'─'*25}\nTOTAL: {total}\n</pre>"
 
     prices, token_ids = get_polymarket_data()
@@ -328,12 +307,13 @@ def format_results(text_lower):
                 elif yes_p < 0.95 and not yes_token:
                     missing_data.append(f"{cat} (Yes)")
             else:
-                # Believe No
-                if no_p < 0.95 and no_token:
-                    edge = int((1.0 - no_p) / no_p * 100) if no_p > 0 else 999
-                    opportunities.append((cat, "No", no_token, no_p, edge))
-                elif no_p < 0.95 and not no_token:
-                    missing_data.append(f"{cat} (No)")
+                # Believe No — only if count == 0 OR partial but still < thresh
+                if count == 0 or (count > 0 and count < thresh):
+                    if no_p < 0.95 and no_token:
+                        edge = int((1.0 - no_p) / no_p * 100) if no_p > 0 else 999
+                        opportunities.append((cat, "No", no_token, no_p, edge))
+                    elif no_p < 0.95 and not no_token:
+                        missing_data.append(f"{cat} (No)")
         
         poly_section = f"\n<b>🎯 Opportunities: {len(opportunities)}</b>"
         

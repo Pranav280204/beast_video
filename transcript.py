@@ -3,6 +3,7 @@ import re
 import requests
 import telebot
 import hashlib
+import json  # Added for safe parsing
 from ecdsa import SigningKey, SECP256k1
 
 # Polymarket trading (only if AUTO_TRADE enabled)
@@ -18,7 +19,7 @@ PRIVATE_KEY = os.environ.get("PRIVATE_KEY")  # Revealed magic key (with or witho
 WALLET_ADDRESS = os.environ.get("WALLET_ADDRESS")  # Optional, auto-derived if missing
 AUTO_TRADE = os.environ.get("AUTO_TRADE", "false").lower() == "true"
 TRADE_AMOUNT = float(os.environ.get("TRADE_AMOUNT", "20"))  # USD per opportunity
-POLYMARKET_SLUG = os.environ.get("POLYMARKET_SLUG", "").strip()  # REQUIRED: e.g. what-will-mrbeast-say-during-his-next-youtube-video
+POLYMARKET_SLUG = os.environ.get("POLYMARKET_SLUG", "").strip()  # REQUIRED
 
 if not BOT_TOKEN:
     print("ERROR: BOT_TOKEN not set!")
@@ -73,7 +74,7 @@ def extract_transcript_text(data):
     collect(data)
     return " ".join(text_parts)
 
-# Fixed word groups (matches current Feb 2026 markets)
+# Fixed word groups
 word_groups = {
     "Dollar": r"\bdollar(s)?\b",
     "Thousand/Million": r"\b(thousand|million|billion)(s)?\b",
@@ -94,14 +95,14 @@ word_groups = {
     "Subscribe": r"\bsubscrib(e|ed|ing|er|s)?\b"
 }
 
-# Fixed thresholds (matches current event)
+# Fixed thresholds
 thresholds = {
     "Dollar": 10,
     "Thousand/Million": 10,
     **{cat: 1 for cat in word_groups if cat not in ["Dollar", "Thousand/Million"]}
 }
 
-# Keyword mapping for market questions → category
+# Keyword mapping
 market_mapping = {
     "dollar 10+ times": "Dollar",
     "thousand / million 10+ times": "Thousand/Million",
@@ -122,7 +123,7 @@ market_mapping = {
     "subscribe": "Subscribe"
 }
 
-# Fetch Polymarket data by slug (direct endpoint - reliable)
+# Fetch Polymarket data with robust JSON string handling
 def get_polymarket_data():
     try:
         url = f"https://gamma-api.polymarket.com/events/slug/{POLYMARKET_SLUG}"
@@ -146,26 +147,43 @@ def get_polymarket_data():
                     break
 
             if matched_cat:
+                # Robust outcome_prices handling (can be list or JSON string)
                 outcome_prices = market.get("outcome_prices") or market.get("outcomePrices", [])
-                if outcome_prices:
-                    yes_price = float(outcome_prices[0])  # Yes is always first
+                if isinstance(outcome_prices, str):
+                    try:
+                        outcome_prices = json.loads(outcome_prices)
+                    except:
+                        outcome_prices = []
+                if isinstance(outcome_prices, list) and len(outcome_prices) > 0:
+                    yes_price = float(outcome_prices[0])
                     prices[matched_cat] = yes_price
 
-                    # Find Yes token_id
-                    tokens = market.get("tokens", [])
+                # Token handling
+                tokens = market.get("tokens", [])
+                if tokens:
                     for token in tokens:
                         if token.get("outcome", "").lower() == "yes":
                             token_ids[matched_cat] = token.get("token_id")
                             break
 
-                    # Fallback to clobTokenIds if no tokens dict
-                    if matched_cat not in token_ids:
-                        outcomes = market.get("outcomes", [])
-                        clob_ids = market.get("clobTokenIds", [])
-                        if "yes" in [o.lower() for o in outcomes]:
-                            idx = [o.lower() for o in outcomes].index("yes")
-                            if idx < len(clob_ids):
-                                token_ids[matched_cat] = clob_ids[idx]
+                # Fallback to clobTokenIds/outcomes if needed
+                if matched_cat not in token_ids:
+                    outcomes = market.get("outcomes", [])
+                    clob_ids = market.get("clobTokenIds", []) or market.get("clob_token_ids", [])
+                    if isinstance(outcomes, str):
+                        try:
+                            outcomes = json.loads(outcomes)
+                        except:
+                            outcomes = []
+                    if isinstance(clob_ids, str):
+                        try:
+                            clob_ids = json.loads(clob_ids)
+                        except:
+                            clob_ids = []
+                    if "yes" in [str(o).lower() for o in outcomes]:
+                        idx = [str(o).lower() for o in outcomes].index("yes")
+                        if idx < len(clob_ids):
+                            token_ids[matched_cat] = clob_ids[idx]
 
         return prices, token_ids
 
@@ -173,12 +191,12 @@ def get_polymarket_data():
         print(f"Polymarket fetch error: {e}")
         return None, None
 
+# Rest of the code unchanged (format_results, handlers, etc.)
 def format_results(text_lower):
     counts = {cat: len(re.findall(pattern, text_lower)) for cat, pattern in word_groups.items()}
     sorted_counts = dict(sorted(counts.items()))
     total = sum(sorted_counts.values())
 
-    # Word count table
     msg = "<pre>"
     msg += f"{'Category':<30} {'Count':>8}\n"
     msg += "-" * 40 + "\n"
@@ -188,7 +206,6 @@ def format_results(text_lower):
     msg += f"{'TOTAL':<30} {total:>8}\n"
     msg += "</pre>"
 
-    # Polymarket section
     prices, token_ids = get_polymarket_data()
     poly_section = ""
     opportunities = []
@@ -220,7 +237,6 @@ def format_results(text_lower):
     else:
         poly_section += "\n<i>⚠️ Failed to fetch market data (check POLYMARKET_SLUG or API).</i>"
 
-    # Auto-trading
     if AUTO_TRADE and PRIVATE_KEY and opportunities and prices:
         try:
             pk = PRIVATE_KEY[2:] if PRIVATE_KEY.startswith('0x') else PRIVATE_KEY
@@ -228,7 +244,7 @@ def format_results(text_lower):
                 host="https://clob.polymarket.com",
                 chain_id=137,
                 key=pk,
-                signature_type=1,  # Magic/revealed key
+                signature_type=1,
                 funder=WALLET_ADDRESS
             )
             creds = client.create_or_derive_api_creds()

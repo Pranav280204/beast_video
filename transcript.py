@@ -133,14 +133,15 @@ MARKET_CONFIGS = {
             "People":               ("simple", r"\bpeople'?s?\b"),
 
             # fuck, fucks, fuck's, fucking, fucked, fucker(s) — also compound: fuckwit, fuckhead
-            # Bleeped form: [ __ ] — only count when context strongly implies "fuck":
-            #   e.g. "what the [ __ ]", "[ __ ] you", "[ __ ] that", "[ __ ] it", "[ __ ] up",
-            #        "[ __ ] with", "[ __ ] off", "[ __ ] around", "mother[ __ ]er"
+            # Bleeped form: [ __ ] — on JRE transcripts the VAST MAJORITY of bleeps are
+            # fuck/fucking variants. Counting all [ __ ] is the most accurate approach
+            # since: (a) JRE is known for heavy fuck usage, (b) the threshold is 20+ so
+            # minor overcounting of occasional "shit" bleeps doesn't affect YES/NO outcome,
+            # (c) the market resolver watches actual video — this is our closest proxy.
             "Fuck/Fucking":         ("simple",
                 r"\bf+u+c+k(?:s|'?s|ing|ed|er'?s?|wit'?s?|head'?s?)?\b"
-                r"|(?:what|the|holy|oh|go|get|mother)\s+\[\s*__\s*\]"   # what the [ __ ], go [ __ ] etc
-                r"|\[\s*__\s*\]\s*(?:you|that|it|up|off|with|around|over|out|this|them|him|her)\b"  # [ __ ] you/that/it etc
-                r"|mother\[\s*__\s*\](?:ing|er'?s?)?"                   # mother[ __ ]ing
+                r"|\[\s*__\s*\]"                                         # ALL bleeps (overwhelmingly fuck on JRE)
+                r"|mother\[\s*__\s*\](?:ing|er'?s?)?"                   # mother[ __ ]ing (explicit form)
             ),
 
             # really (adverb, no meaningful plural/possessive)

@@ -651,65 +651,152 @@ def format_results(text: str, market_key: str) -> str:
 # calls format_results, then sends to the user.
 # ─────────────────────────────────────────────
 
+def log(msg: str):
+    """Print with immediate flush so logs appear in real time."""
+    import datetime
+    ts = datetime.datetime.utcnow().strftime("%H:%M:%S")
+    print(f"[{ts}] {msg}", flush=True)
+
+
 def monitor_channel(chat_id: int, market_key: str, stop_event: threading.Event):
-    config      = MARKET_CONFIGS[market_key]
-    chan_key    = config["channel_key"]
-    channel_id  = CHANNELS[chan_key]["channel_id"]
-    chan_label  = config["label"]
+    import datetime
+    import traceback
 
-    last_vid_id = None
-    # Seed with the current latest video so we don't re-process it
-    seed = get_latest_video(channel_id)
-    if seed:
-        last_vid_id = seed["video_id"]
-        print(f"[Monitor] Seeded with video {last_vid_id} for chat {chat_id}")
+    try:
+        config     = MARKET_CONFIGS[market_key]
+        chan_key   = config["channel_key"]
+        channel_id = CHANNELS[chan_key]["channel_id"]
+        chan_label = config["label"]
 
-    bot.send_message(
-        chat_id,
-        f"👁 <b>Monitoring started</b> for {chan_label}\n"
-        f"Checking every <b>{POLL_INTERVAL}s</b> for new videos.\n"
-        f"Use /stop to cancel.",
-        parse_mode="HTML",
-    )
+        log(f"[Monitor] Thread started — market={market_key} channel={channel_id} chat={chat_id}")
 
-    while not stop_event.is_set():
-        stop_event.wait(POLL_INTERVAL)
-        if stop_event.is_set():
-            break
-        try:
-            latest = get_latest_video(channel_id)
-            if not latest:
-                continue
-            vid_id = latest["video_id"]
-            if vid_id == last_vid_id:
-                continue   # Nothing new
-            # New video detected!
-            last_vid_id = vid_id
-            title = latest["title"]
-            print(f"[Monitor] New video: {vid_id} — {title}")
-            bot.send_message(
-                chat_id,
-                f"🆕 <b>New video detected!</b>\n"
-                f"🎬 <a href='https://youtu.be/{vid_id}'>{title}</a>\n"
-                f"⏳ Fetching transcript…",
-                parse_mode="HTML",
-                disable_web_page_preview=True,
-            )
-            transcript = fetch_transcript(vid_id)
-            if not transcript:
+        # ── Sanity check: YouTube keys ──────────
+        if not YT_KEYS.available:
+            msg = "❌ No YouTube API keys available. Cannot monitor."
+            log(f"[Monitor] {msg}")
+            bot.send_message(chat_id, msg)
+            return
+
+        log(f"[Monitor] YouTube keys: {YT_KEYS.status()}")
+
+        # ── Seed: grab current latest so we don't re-process it ──
+        log(f"[Monitor] Seeding — fetching latest video from channel {channel_id}…")
+        seed = get_latest_video(channel_id)
+        if seed:
+            last_vid_id = seed["video_id"]
+            log(f"[Monitor] Seeded with: {last_vid_id} — {seed['title']}")
+        else:
+            last_vid_id = None
+            log(f"[Monitor] ⚠️  Seed returned None — will treat first found video as new")
+
+        bot.send_message(
+            chat_id,
+            f"👁 <b>Monitoring started</b> — {chan_label}\n"
+            f"🔑 Keys: <code>{YT_KEYS.status()}</code>\n"
+            f"⏱ Checking every <b>{POLL_INTERVAL}s</b>\n"
+            f"📌 Seeded video: <code>{last_vid_id or 'none'}</code>\n\n"
+            f"Use /stop to cancel.",
+            parse_mode="HTML",
+        )
+
+        poll_count = 0
+
+        # ── Main poll loop ──────────────────────
+        while not stop_event.is_set():
+            stop_event.wait(POLL_INTERVAL)
+            if stop_event.is_set():
+                log(f"[Monitor] Stop event received — exiting loop.")
+                break
+
+            poll_count += 1
+            log(f"[Monitor] Poll #{poll_count} — checking {chan_label}…")
+
+            try:
+                latest = get_latest_video(channel_id)
+
+                if latest is None:
+                    log(f"[Monitor] Poll #{poll_count} — get_latest_video returned None (API error or all keys exhausted)")
+                    bot.send_message(
+                        chat_id,
+                        f"⚠️ Poll #{poll_count}: YouTube API returned nothing. "
+                        f"Keys: {YT_KEYS.status()}",
+                    )
+                    continue
+
+                vid_id = latest["video_id"]
+                title  = latest["title"]
+                log(f"[Monitor] Poll #{poll_count} — latest: {vid_id} | {title}")
+
+                if vid_id == last_vid_id:
+                    log(f"[Monitor] Poll #{poll_count} — no new video.")
+                    # Send a quiet heartbeat every 5 polls so you know it's alive
+                    if poll_count % 5 == 0:
+                        bot.send_message(
+                            chat_id,
+                            f"💓 Heartbeat #{poll_count} — no new video yet.\n"
+                            f"Latest: <code>{vid_id}</code>\n"
+                            f"Keys: {YT_KEYS.status()}",
+                            parse_mode="HTML",
+                        )
+                    continue
+
+                # ── New video! ──────────────────
+                log(f"[Monitor] 🆕 NEW VIDEO: {vid_id} — {title}")
+                last_vid_id = vid_id
+
                 bot.send_message(
                     chat_id,
-                    "⚠️ Transcript not available yet. Will retry on next check.",
+                    f"🆕 <b>New video detected!</b> (poll #{poll_count})\n"
+                    f"🎬 <a href='https://youtu.be/{vid_id}'>{title}</a>\n"
+                    f"⏳ Fetching transcript…",
                     parse_mode="HTML",
+                    disable_web_page_preview=True,
                 )
-                last_vid_id = None   # reset so we retry same video next tick
-                continue
-            result = format_results(transcript, market_key)
-            bot.send_message(chat_id, result, parse_mode="HTML")
-        except Exception as e:
-            print(f"[Monitor] Error: {e}")
 
-    bot.send_message(chat_id, "⛔ Monitoring stopped.", parse_mode="HTML")
+                log(f"[Monitor] Fetching transcript for {vid_id}…")
+                transcript = fetch_transcript(vid_id)
+
+                if not transcript:
+                    log(f"[Monitor] ⚠️  Transcript not available yet for {vid_id}")
+                    bot.send_message(
+                        chat_id,
+                        "⚠️ Transcript not available yet — will retry next poll.",
+                        parse_mode="HTML",
+                    )
+                    last_vid_id = None   # retry same video next tick
+                    continue
+
+                log(f"[Monitor] ✅ Transcript fetched ({len(transcript)} chars) — running analysis…")
+                result = format_results(transcript, market_key)
+                bot.send_message(chat_id, result, parse_mode="HTML")
+                log(f"[Monitor] ✅ Results sent to chat {chat_id}")
+
+            except Exception as e:
+                tb = traceback.format_exc()
+                log(f"[Monitor] ❌ Exception in poll #{poll_count}: {e}\n{tb}")
+                try:
+                    bot.send_message(
+                        chat_id,
+                        f"❌ Error in poll #{poll_count}:\n<code>{str(e)[:300]}</code>",
+                        parse_mode="HTML",
+                    )
+                except Exception:
+                    pass
+
+        bot.send_message(chat_id, "⛔ Monitoring stopped.", parse_mode="HTML")
+        log(f"[Monitor] Thread exited cleanly for chat {chat_id}.")
+
+    except Exception as fatal:
+        tb = traceback.format_exc()
+        log(f"[Monitor] 💀 FATAL crash in monitor thread: {fatal}\n{tb}")
+        try:
+            bot.send_message(
+                chat_id,
+                f"💀 Monitor thread crashed fatally:\n<code>{str(fatal)[:300]}</code>\n\nUse /market to restart.",
+                parse_mode="HTML",
+            )
+        except Exception:
+            pass
 
 
 def start_monitoring(chat_id: int, market_key: str):

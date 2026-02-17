@@ -133,7 +133,15 @@ MARKET_CONFIGS = {
             "People":               ("simple", r"\bpeople'?s?\b"),
 
             # fuck, fucks, fuck's, fucking, fucked, fucker(s) — also compound: fuckwit, fuckhead
-            "Fuck/Fucking":         ("simple", r"\bf+u+c+k(?:s|'?s|ing|ed|er'?s?|wit'?s?|head'?s?)?\b"),
+            # Bleeped form: [ __ ] — only count when context strongly implies "fuck":
+            #   e.g. "what the [ __ ]", "[ __ ] you", "[ __ ] that", "[ __ ] it", "[ __ ] up",
+            #        "[ __ ] with", "[ __ ] off", "[ __ ] around", "mother[ __ ]er"
+            "Fuck/Fucking":         ("simple",
+                r"\bf+u+c+k(?:s|'?s|ing|ed|er'?s?|wit'?s?|head'?s?)?\b"
+                r"|(?:what|the|holy|oh|go|get|mother)\s+\[\s*__\s*\]"   # what the [ __ ], go [ __ ] etc
+                r"|\[\s*__\s*\]\s*(?:you|that|it|up|off|with|around|over|out|this|them|him|her)\b"  # [ __ ] you/that/it etc
+                r"|mother\[\s*__\s*\](?:ing|er'?s?)?"                   # mother[ __ ]ing
+            ),
 
             # really (adverb, no meaningful plural/possessive)
             "Really":               ("simple", r"\breally\b"),

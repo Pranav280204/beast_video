@@ -22,13 +22,78 @@ if os.environ.get("AUTO_TRADE", "false").lower() == "true":
 # ─────────────────────────────────────────────
 BOT_TOKEN          = os.environ.get("BOT_TOKEN")
 API_TOKEN          = os.environ.get("API_TOKEN")           # youtube-transcript.io Basic token
-YOUTUBE_API_KEY    = os.environ.get("YOUTUBE_API_KEY")     # Google Data API v3 key
 PRIVATE_KEY        = os.environ.get("PRIVATE_KEY")
 WALLET_ADDRESS     = os.environ.get("WALLET_ADDRESS")
 AUTO_TRADE         = os.environ.get("AUTO_TRADE", "false").lower() == "true"
 TRADE_AMOUNT       = float(os.environ.get("TRADE_AMOUNT", "10"))
 MIN_TRADE_AMOUNT   = float(os.environ.get("MIN_TRADE_AMOUNT", "1"))
 POLL_INTERVAL      = int(os.environ.get("POLL_INTERVAL", "60"))   # seconds between checks
+
+# ─────────────────────────────────────────────
+# YOUTUBE API KEY ROTATOR
+# Supports comma-separated keys:
+#   YOUTUBE_API_KEY=key1,key2,key3
+# Rotates round-robin on every call.
+# If a key returns 403 (quota exceeded) it is
+# automatically skipped and the next key is tried.
+# ─────────────────────────────────────────────
+
+class YouTubeKeyRotator:
+    def __init__(self, raw_env: str | None):
+        self._keys  = [k.strip() for k in (raw_env or "").split(",") if k.strip()]
+        self._index = 0
+        self._lock  = threading.Lock()
+        self._exhausted: set[int] = set()   # indices of quota-exceeded keys
+
+    @property
+    def available(self) -> bool:
+        return bool(self._keys) and len(self._exhausted) < len(self._keys)
+
+    @property
+    def count(self) -> int:
+        return len(self._keys)
+
+    def next_key(self) -> str | None:
+        """Return next available key (round-robin), or None if all exhausted."""
+        with self._lock:
+            if not self._keys:
+                return None
+            start = self._index
+            while True:
+                if self._index not in self._exhausted:
+                    key = self._keys[self._index]
+                    self._index = (self._index + 1) % len(self._keys)
+                    return key
+                self._index = (self._index + 1) % len(self._keys)
+                if self._index == start:
+                    return None   # all keys exhausted
+
+    def mark_exhausted(self, key: str):
+        """Call when a key returns HTTP 403 (quota exceeded)."""
+        with self._lock:
+            try:
+                idx = self._keys.index(key)
+                self._exhausted.add(idx)
+                remaining = len(self._keys) - len(self._exhausted)
+                print(f"⚠️  YouTube key #{idx+1} quota exceeded. "
+                      f"{remaining}/{len(self._keys)} keys remaining.")
+            except ValueError:
+                pass
+
+    def reset_exhausted(self):
+        """Call at midnight to refresh daily quota."""
+        with self._lock:
+            self._exhausted.clear()
+            print("🔄 YouTube API key quotas reset.")
+
+    def status(self) -> str:
+        with self._lock:
+            total  = len(self._keys)
+            active = total - len(self._exhausted)
+            return f"{active}/{total} keys active"
+
+
+YT_KEYS = YouTubeKeyRotator(os.environ.get("YOUTUBE_API_KEY"))
 
 POLYMARKET_SLUG_1  = os.environ.get("POLYMARKET_SLUG",  "what-will-mrbeast-say-during-his-next-youtube-video").strip()
 POLYMARKET_SLUG_2  = os.environ.get("POLYMARKET_SLUG_2","what-will-be-said-on-the-first-joe-rogan-experience-episode-of-the-week-february-22").strip()
@@ -164,25 +229,66 @@ def get_token_id_for_outcome(market, target_outcome: str) -> str | None:
 # YOUTUBE DATA API — LATEST NON-SHORT VIDEO
 # ─────────────────────────────────────────────
 
+def _yt_get(url: str, params: dict) -> "requests.Response | None":
+    """
+    Make a YouTube Data API GET request using key rotation.
+    Automatically retries with the next key if HTTP 403 (quota exceeded).
+    Returns the Response object, or None if all keys are exhausted / unavailable.
+    """
+    if not YT_KEYS.available:
+        print("⚠️  All YouTube API keys exhausted.")
+        return None
+
+    # Strip any pre-existing key from params — we inject it per-attempt
+    base_params = {k: v for k, v in params.items() if k != "key"}
+
+    tried = 0
+    while tried < YT_KEYS.count:
+        key = YT_KEYS.next_key()
+        if key is None:
+            print("⚠️  No YouTube API keys available.")
+            return None
+        request_params = {**base_params, "key": key}   # one clean key per request
+        try:
+            r = requests.get(url, params=request_params, timeout=15)
+            if r.status_code == 403:
+                print(f"⚠️  Key quota hit (403). Rotating to next key…")
+                YT_KEYS.mark_exhausted(key)
+                tried += 1
+                continue
+            if r.status_code == 400:
+                print(f"❌ Bad request (400): {r.text[:200]}")
+                return None
+            r.raise_for_status()
+            return r
+        except requests.exceptions.HTTPError as e:
+            print(f"❌ HTTP error: {e}")
+            tried += 1
+        except Exception as e:
+            print(f"❌ YouTube API error: {e}")
+            return None
+    return None
+
+
 def get_latest_video(channel_id: str) -> dict | None:
     """Return latest non-Shorts video dict or None."""
-    if not YOUTUBE_API_KEY:
-        print("⚠️  YOUTUBE_API_KEY not set – cannot poll YouTube.")
+    if not YT_KEYS.available:
+        print("⚠️  No YouTube API keys set or all exhausted.")
         return None
     try:
-        url = "https://www.googleapis.com/youtube/v3/search"
-        params = {
-            "key":        YOUTUBE_API_KEY,
-            "channelId":  channel_id,
-            "part":       "snippet",
-            "order":      "date",
-            "type":       "video",
-            "maxResults": 5,
-        }
-        r = requests.get(url, params=params, timeout=15)
-        r.raise_for_status()
-        items = r.json().get("items", [])
-        for item in items:
+        r = _yt_get(
+            "https://www.googleapis.com/youtube/v3/search",
+            {
+                "channelId":  channel_id,
+                "part":       "snippet",
+                "order":      "date",
+                "type":       "video",
+                "maxResults": 5,
+            },
+        )
+        if r is None:
+            return None
+        for item in r.json().get("items", []):
             vid_id = item["id"]["videoId"]
             title  = item["snippet"]["title"]
             # Exclude Shorts by checking duration via videos endpoint
@@ -196,18 +302,19 @@ def get_latest_video(channel_id: str) -> dict | None:
 
 def is_short(video_id: str) -> bool:
     """Return True if the video is a YouTube Short (≤ 60 s)."""
-    if not YOUTUBE_API_KEY:
+    if not YT_KEYS.available:
         return False
     try:
-        url = "https://www.googleapis.com/youtube/v3/videos"
-        params = {"key": YOUTUBE_API_KEY, "id": video_id, "part": "contentDetails"}
-        r = requests.get(url, params=params, timeout=10)
-        r.raise_for_status()
+        r = _yt_get(
+            "https://www.googleapis.com/youtube/v3/videos",
+            {"id": video_id, "part": "contentDetails"},
+        )
+        if r is None:
+            return False
         items = r.json().get("items", [])
         if not items:
             return False
-        duration = items[0]["contentDetails"]["duration"]   # ISO 8601
-        # Parse PT#M#S — Shorts are ≤ 60 seconds
+        duration  = items[0]["contentDetails"]["duration"]
         total_sec = parse_iso8601_duration(duration)
         return total_sec <= 60
     except:
@@ -760,11 +867,11 @@ def handle_callback(call: types.CallbackQuery):
             return
         mk = state.get("market_key")
         bot.edit_message_reply_markup(chat_id, call.message.message_id, reply_markup=None)
-        if not YOUTUBE_API_KEY:
+        if not YT_KEYS.available:
             bot.send_message(
                 chat_id,
-                "⚠️ <b>YOUTUBE_API_KEY</b> is not set in environment.\n"
-                "Cannot poll YouTube. Please set it and restart the bot.",
+                "⚠️ <b>YOUTUBE_API_KEY</b> is not set or all keys are exhausted.\n"
+                "Please set it (comma-separated for multiple keys) and restart the bot.",
                 parse_mode="HTML",
             )
             bot.answer_callback_query(call.id)
@@ -886,8 +993,26 @@ print(f"  Markets: {', '.join(MARKET_CONFIGS.keys())}")
 print(f"  AUTO_TRADE:    {AUTO_TRADE}")
 print(f"  TRADE_AMOUNT:  ${max(TRADE_AMOUNT, MIN_TRADE_AMOUNT)}")
 print(f"  POLL_INTERVAL: {POLL_INTERVAL}s")
-print(f"  YouTube API:   {'✅' if YOUTUBE_API_KEY else '❌ NOT SET'}")
+print(f"  YouTube API:   {'✅ ' + YT_KEYS.status() if YT_KEYS.available else '❌ NOT SET'}")
 print(f"  Transcript API:{'✅' if API_TOKEN else '❌ NOT SET'}")
 print(f"  Wallet:        {WALLET_ADDRESS[:10] + '…' if WALLET_ADDRESS else 'Not set'}")
+
+# ─────────────────────────────────────────────
+# DAILY QUOTA RESET — fires at midnight UTC
+# Google resets YouTube API quotas at midnight PT
+# (≈07:00 UTC). We reset at 00:00 UTC to be safe.
+# ─────────────────────────────────────────────
+
+def _midnight_reset_loop():
+    import datetime
+    while True:
+        now  = datetime.datetime.utcnow()
+        nxt  = (now + datetime.timedelta(days=1)).replace(
+                    hour=0, minute=0, second=0, microsecond=0)
+        secs = (nxt - now).total_seconds()
+        time.sleep(secs)
+        YT_KEYS.reset_exhausted()
+
+threading.Thread(target=_midnight_reset_loop, daemon=True).start()
 
 bot.infinity_polling()

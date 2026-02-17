@@ -272,46 +272,94 @@ def _yt_get(url: str, params: dict) -> "requests.Response | None":
     return None
 
 
+
+def _uploads_playlist_id(channel_id: str) -> str:
+    """
+    Convert a channel ID to its Uploads playlist ID.
+    UC... → UU...  (just swap the 2nd char from C to U)
+    No API call needed — this is a guaranteed YouTube convention.
+    """
+    return "UU" + channel_id[2:]
+
+
 def get_latest_video(channel_id: str) -> dict | None:
-    """Return latest non-Shorts video dict or None."""
+    """
+    Return the latest non-Shorts video dict or None.
+
+    Quota cost: 1 unit (playlistItems.list) + 1 unit (videos.list batch)
+    vs old search.list which cost 100 units per call.
+    """
     if not YT_KEYS.available:
-        log(f"[YT] ❌ No YouTube API keys available.")
+        log("[YT] ❌ No YouTube API keys available.")
         return None
     try:
-        log(f"[YT] search → channelId={channel_id}")
+        playlist_id = _uploads_playlist_id(channel_id)
+        log(f"[YT] playlistItems.list → playlistId={playlist_id}")
+
+        # ── Step 1: fetch latest 5 uploads (1 quota unit) ──────────────
         r = _yt_get(
-            "https://www.googleapis.com/youtube/v3/search",
+            "https://www.googleapis.com/youtube/v3/playlistItems",
             {
-                "channelId":  channel_id,
+                "playlistId": playlist_id,
                 "part":       "snippet",
-                "order":      "date",
-                "type":       "video",
                 "maxResults": 5,
             },
         )
         if r is None:
-            log(f"[YT] search returned None (key error / bad request / all keys exhausted)")
+            log("[YT] playlistItems.list returned None")
             return None
 
         data  = r.json()
         items = data.get("items", [])
-        log(f"[YT] search OK — {len(items)} items returned")
+        log(f"[YT] playlistItems OK — {len(items)} items")
 
         if not items:
-            log(f"[YT] ⚠️  0 items — raw response: {str(data)[:300]}")
+            log(f"[YT] ⚠️  0 items — raw: {str(data)[:300]}")
             return None
 
+        # Build list of (video_id, title) preserving upload order
+        candidates = []
         for item in items:
-            vid_id = item["id"]["videoId"]
-            title  = item["snippet"]["title"]
-            log(f"[YT] Checking: {vid_id} | {title}")
-            short  = is_short(vid_id)
-            log(f"[YT]   → is_short={short}")
-            if not short:
-                log(f"[YT] ✅ Using: {vid_id} | {title}")
+            snippet = item.get("snippet", {})
+            rid     = snippet.get("resourceId", {})
+            vid_id  = rid.get("videoId")
+            title   = snippet.get("title", "")
+            if vid_id:
+                candidates.append((vid_id, title))
+                log(f"[YT]   candidate: {vid_id} | {title}")
+
+        if not candidates:
+            log("[YT] No valid videoIds found in playlist response.")
+            return None
+
+        # ── Step 2: batch-check durations for all candidates (1 quota unit) ──
+        vid_ids_str = ",".join(v for v, _ in candidates)
+        r2 = _yt_get(
+            "https://www.googleapis.com/youtube/v3/videos",
+            {"id": vid_ids_str, "part": "contentDetails"},
+        )
+
+        durations: dict[str, int] = {}   # video_id → total seconds
+        if r2:
+            for v_item in r2.json().get("items", []):
+                vid   = v_item["id"]
+                dur   = v_item["contentDetails"]["duration"]
+                secs  = parse_iso8601_duration(dur)
+                durations[vid] = secs
+                log(f"[YT]   duration: {vid} → {dur} ({secs}s)")
+        else:
+            log("[YT] ⚠️  videos.list failed — will treat all as non-Shorts")
+
+        # ── Step 3: pick first non-Short ───────────────────────────────
+        for vid_id, title in candidates:
+            secs   = durations.get(vid_id, 999)   # unknown → treat as long
+            is_sh  = secs <= 60
+            log(f"[YT]   {vid_id}: {secs}s → {'SHORT ❌' if is_sh else 'VIDEO ✅'}")
+            if not is_sh:
+                log(f"[YT] ✅ Selected: {vid_id} | {title}")
                 return {"video_id": vid_id, "title": title}
 
-        log(f"[YT] All {len(items)} results were Shorts — returning None")
+        log(f"[YT] All {len(candidates)} candidates were Shorts — returning None")
         return None
 
     except Exception as e:
@@ -321,7 +369,10 @@ def get_latest_video(channel_id: str) -> dict | None:
 
 
 def is_short(video_id: str) -> bool:
-    """Return True if the video is a YouTube Short (≤ 60 s)."""
+    """
+    Standalone short-check (used outside get_latest_video if ever needed).
+    Costs 1 quota unit.
+    """
     if not YT_KEYS.available:
         return False
     try:
@@ -330,15 +381,15 @@ def is_short(video_id: str) -> bool:
             {"id": video_id, "part": "contentDetails"},
         )
         if r is None:
-            log(f"[YT] is_short({video_id}): _yt_get returned None → assuming NOT short")
+            log(f"[YT] is_short({video_id}): no response → assuming NOT short")
             return False
         items = r.json().get("items", [])
         if not items:
-            log(f"[YT] is_short({video_id}): no items in response → assuming NOT short")
+            log(f"[YT] is_short({video_id}): 0 items → assuming NOT short")
             return False
         duration  = items[0]["contentDetails"]["duration"]
         total_sec = parse_iso8601_duration(duration)
-        log(f"[YT] is_short({video_id}): duration={duration} ({total_sec}s)")
+        log(f"[YT] is_short({video_id}): {duration} = {total_sec}s")
         return total_sec <= 60
     except Exception as e:
         log(f"[YT] is_short({video_id}): exception {e} → assuming NOT short")

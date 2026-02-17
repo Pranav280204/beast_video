@@ -684,7 +684,14 @@ def format_results(text: str, market_key: str) -> str:
     # ── Auto-trade ───────────────────────────
     trade_results = []
     if AUTO_TRADE and PRIVATE_KEY and opportunities:
+        import datetime
+        def _ist() -> str:
+            utc = datetime.datetime.utcnow()
+            ist = utc + datetime.timedelta(hours=5, minutes=30)
+            return ist.strftime("%H:%M:%S IST")
+
         actual_amt = max(TRADE_AMOUNT, MIN_TRADE_AMOUNT)
+        t_trades_start = _ist()
         try:
             pk     = PRIVATE_KEY[2:] if PRIVATE_KEY.startswith("0x") else PRIVATE_KEY
             client = ClobClient(
@@ -697,25 +704,30 @@ def format_results(text: str, market_key: str) -> str:
             client.set_api_creds(client.create_or_derive_api_creds())
             for cat, side, tok, price, edge in opportunities:
                 try:
-                    args   = MarketOrderArgs(token_id=tok, amount=actual_amt, side=BUY)
-                    signed = client.create_market_order(args)
-                    resp   = client.post_order(signed, OrderType.FOK)
-                    status = resp.get("status", "")
+                    t_before       = datetime.datetime.utcnow()
+                    args           = MarketOrderArgs(token_id=tok, amount=actual_amt, side=BUY)
+                    signed         = client.create_market_order(args)
+                    resp           = client.post_order(signed, OrderType.FOK)
+                    t_after        = datetime.datetime.utcnow()
+                    elapsed        = (t_after - t_before).total_seconds()
+                    trade_ts       = (_ist())
+                    status         = resp.get("status", "")
                     if resp.get("order_id") or resp.get("success") or status in ("matched","live","open"):
-                        trade_results.append(f"✅ {cat[:16]} {side} ${actual_amt}")
+                        trade_results.append(f"✅ {cat[:16]:<16} {side}  ${actual_amt}  @{trade_ts}  ({elapsed:.2f}s)")
                     else:
-                        trade_results.append(f"⚠️ {cat[:16]} {side} No fill")
+                        trade_results.append(f"⚠️ {cat[:16]:<16} {side}  No fill  @{trade_ts}  ({elapsed:.2f}s)")
                     time.sleep(0.5)
-                except Exception:
-                    trade_results.append(f"❌ {cat[:16]} {side} Error")
+                except Exception as ex:
+                    trade_results.append(f"❌ {cat[:16]:<16} {side}  Error: {str(ex)[:40]}  @{_ist()}")
                     time.sleep(0.5)
         except Exception as e:
             trade_results.append(f"❌ Setup failed: {str(e)[:60]}")
 
     result = f"<b>Polymarket Sniper 🚀</b>\n\n{msg}{poly_section}"
     if trade_results:
-        result += f"\n\n<b>🤖 Trades (${max(TRADE_AMOUNT, MIN_TRADE_AMOUNT)})</b>\n"
+        result += f"\n\n<b>🤖 Trades (${max(TRADE_AMOUNT, MIN_TRADE_AMOUNT)}) — started {t_trades_start}</b>\n<pre>"
         result += "\n".join(trade_results[:10])
+        result += "</pre>"
     return result
 
 
@@ -738,6 +750,14 @@ def monitor_channel(chat_id: int, market_key: str, stop_event: threading.Event):
     import traceback
 
     try:
+        import datetime, traceback
+
+        def ist_now() -> str:
+            """Return current time in IST (UTC+5:30) as HH:MM:SS string."""
+            utc = datetime.datetime.utcnow()
+            ist = utc + datetime.timedelta(hours=5, minutes=30)
+            return ist.strftime("%d %b %Y  %H:%M:%S IST")
+
         config     = MARKET_CONFIGS[market_key]
         chan_key   = config["channel_key"]
         channel_id = CHANNELS[chan_key]["channel_id"]
@@ -767,8 +787,9 @@ def monitor_channel(chat_id: int, market_key: str, stop_event: threading.Event):
         bot.send_message(
             chat_id,
             f"👁 <b>Monitoring started</b> — {chan_label}\n"
+            f"🕐 <b>Started:</b> <code>{ist_now()}</code>\n"
             f"🔑 Keys: <code>{YT_KEYS.status()}</code>\n"
-            f"⏱ Checking every <b>{POLL_INTERVAL}s</b>\n"
+            f"⏱ Polling every <b>{POLL_INTERVAL}s</b>\n"
             f"📌 Seeded video: <code>{last_vid_id or 'none'}</code>\n\n"
             f"Use /stop to cancel.",
             parse_mode="HTML",
@@ -787,13 +808,15 @@ def monitor_channel(chat_id: int, market_key: str, stop_event: threading.Event):
             log(f"[Monitor] Poll #{poll_count} — checking {chan_label}…")
 
             try:
+                t_poll_start = datetime.datetime.utcnow()
                 latest = get_latest_video(channel_id)
 
                 if latest is None:
-                    log(f"[Monitor] Poll #{poll_count} — get_latest_video returned None (API error or all keys exhausted)")
+                    log(f"[Monitor] Poll #{poll_count} — get_latest_video returned None")
                     bot.send_message(
                         chat_id,
-                        f"⚠️ Poll #{poll_count}: YouTube API returned nothing. "
+                        f"⚠️ Poll #{poll_count} [{ist_now()}]\n"
+                        f"YouTube API returned nothing.\n"
                         f"Keys: {YT_KEYS.status()}",
                     )
                     continue
@@ -804,47 +827,87 @@ def monitor_channel(chat_id: int, market_key: str, stop_event: threading.Event):
 
                 if vid_id == last_vid_id:
                     log(f"[Monitor] Poll #{poll_count} — no new video.")
-                    # Send a quiet heartbeat every 5 polls so you know it's alive
                     if poll_count % 5 == 0:
                         bot.send_message(
                             chat_id,
-                            f"💓 Heartbeat #{poll_count} — no new video yet.\n"
-                            f"Latest: <code>{vid_id}</code>\n"
-                            f"Keys: {YT_KEYS.status()}",
+                            f"💓 <b>Heartbeat</b> — poll #{poll_count}\n"
+                            f"🕐 <code>{ist_now()}</code>\n"
+                            f"📺 Latest: <code>{vid_id}</code>\n"
+                            f"🔑 Keys: {YT_KEYS.status()}",
                             parse_mode="HTML",
                         )
                     continue
 
-                # ── New video! ──────────────────
-                log(f"[Monitor] 🆕 NEW VIDEO: {vid_id} — {title}")
+                # ── New video detected ──────────
+                t_video_detected = ist_now()
+                log(f"[Monitor] 🆕 NEW VIDEO at {t_video_detected}: {vid_id} — {title}")
                 last_vid_id = vid_id
 
                 bot.send_message(
                     chat_id,
-                    f"🆕 <b>New video detected!</b> (poll #{poll_count})\n"
+                    f"🆕 <b>New video detected!</b>\n"
+                    f"🕐 <b>Detected at:</b> <code>{t_video_detected}</code>\n"
                     f"🎬 <a href='https://youtu.be/{vid_id}'>{title}</a>\n"
                     f"⏳ Fetching transcript…",
                     parse_mode="HTML",
                     disable_web_page_preview=True,
                 )
 
+                # ── Fetch transcript ────────────
+                t_transcript_start = datetime.datetime.utcnow()
                 log(f"[Monitor] Fetching transcript for {vid_id}…")
                 transcript = fetch_transcript(vid_id)
+                t_transcript_end   = datetime.datetime.utcnow()
+                transcript_secs    = (t_transcript_end - t_transcript_start).total_seconds()
 
                 if not transcript:
                     log(f"[Monitor] ⚠️  Transcript not available yet for {vid_id}")
                     bot.send_message(
                         chat_id,
-                        "⚠️ Transcript not available yet — will retry next poll.",
+                        f"⚠️ <b>Transcript not ready yet</b>\n"
+                        f"🕐 <code>{ist_now()}</code>\n"
+                        f"Will retry on next poll.",
                         parse_mode="HTML",
                     )
                     last_vid_id = None   # retry same video next tick
                     continue
 
-                log(f"[Monitor] ✅ Transcript fetched ({len(transcript)} chars) — running analysis…")
-                result = format_results(transcript, market_key)
-                bot.send_message(chat_id, result, parse_mode="HTML")
-                log(f"[Monitor] ✅ Results sent to chat {chat_id}")
+                t_transcript_done = ist_now()
+                log(f"[Monitor] ✅ Transcript fetched in {transcript_secs:.1f}s ({len(transcript)} chars)")
+
+                bot.send_message(
+                    chat_id,
+                    f"📄 <b>Transcript ready</b>\n"
+                    f"🕐 <b>Fetched at:</b> <code>{t_transcript_done}</code>\n"
+                    f"⏱ Took: <code>{transcript_secs:.1f}s</code>  |  "
+                    f"Length: <code>{len(transcript):,} chars</code>\n"
+                    f"🔍 Running analysis…",
+                    parse_mode="HTML",
+                )
+
+                # ── Analysis + trades ───────────
+                t_analysis_start = datetime.datetime.utcnow()
+                result           = format_results(transcript, market_key)
+                t_analysis_end   = datetime.datetime.utcnow()
+                analysis_secs    = (t_analysis_end - t_analysis_start).total_seconds()
+
+                # ── Total pipeline time ─────────
+                total_secs = (t_analysis_end - t_poll_start).total_seconds()
+
+                timing_footer = (
+                    f"\n\n<b>⏱ Pipeline timing</b>\n<pre>"
+                    f"Video detected : {t_video_detected}\n"
+                    f"Transcript done: {t_transcript_done}\n"
+                    f"Analysis done  : {ist_now()}\n"
+                    f"─────────────────────────────\n"
+                    f"Transcript fetch : {transcript_secs:.1f}s\n"
+                    f"Analysis + trades: {analysis_secs:.1f}s\n"
+                    f"Total pipeline   : {total_secs:.1f}s\n"
+                    f"</pre>"
+                )
+
+                bot.send_message(chat_id, result + timing_footer, parse_mode="HTML")
+                log(f"[Monitor] ✅ Done. Pipeline took {total_secs:.1f}s total.")
 
             except Exception as e:
                 tb = traceback.format_exc()
@@ -852,13 +915,19 @@ def monitor_channel(chat_id: int, market_key: str, stop_event: threading.Event):
                 try:
                     bot.send_message(
                         chat_id,
-                        f"❌ Error in poll #{poll_count}:\n<code>{str(e)[:300]}</code>",
+                        f"❌ <b>Error in poll #{poll_count}</b>\n"
+                        f"🕐 <code>{ist_now()}</code>\n"
+                        f"<code>{str(e)[:300]}</code>",
                         parse_mode="HTML",
                     )
                 except Exception:
                     pass
 
-        bot.send_message(chat_id, "⛔ Monitoring stopped.", parse_mode="HTML")
+        bot.send_message(
+            chat_id,
+            f"⛔ <b>Monitoring stopped</b>\n🕐 <code>{ist_now()}</code>",
+            parse_mode="HTML",
+        )
         log(f"[Monitor] Thread exited cleanly for chat {chat_id}.")
 
     except Exception as fatal:
@@ -867,7 +936,9 @@ def monitor_channel(chat_id: int, market_key: str, stop_event: threading.Event):
         try:
             bot.send_message(
                 chat_id,
-                f"💀 Monitor thread crashed fatally:\n<code>{str(fatal)[:300]}</code>\n\nUse /market to restart.",
+                f"💀 <b>Monitor thread crashed</b>\n"
+                f"🕐 <code>{ist_now()}</code>\n"
+                f"<code>{str(fatal)[:300]}</code>\n\nUse /market to restart.",
                 parse_mode="HTML",
             )
         except Exception:

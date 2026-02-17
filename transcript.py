@@ -23,7 +23,6 @@ AUTO_TRADE = os.environ.get("AUTO_TRADE", "false").lower() == "true"
 TRADE_AMOUNT = float(os.environ.get("TRADE_AMOUNT", "10"))
 MIN_TRADE_AMOUNT = float(os.environ.get("MIN_TRADE_AMOUNT", "1"))
 
-# Market slugs from env
 POLYMARKET_SLUG_1 = os.environ.get("POLYMARKET_SLUG", "what-will-mrbeast-say-during-his-next-youtube-video").strip()
 POLYMARKET_SLUG_2 = os.environ.get("POLYMARKET_SLUG_2", "what-will-be-said-on-the-first-joe-rogan-experience-episode-of-the-week-february-22").strip()
 
@@ -32,12 +31,52 @@ if not BOT_TOKEN:
     exit(1)
 
 bot = telebot.TeleBot(BOT_TOKEN)
-
-# Per-user state: stores selected market key
 user_market_selection = {}
+
+
+# ─────────────────────────────────────────────
+# COUNTING ENGINE
+# Rules:
+#  1. Plurals/possessives count
+#  2. Full-name mention counts as ONE (e.g. "Pam Bondi" = 1, not 2)
+#  3. Compound words count (e.g. "warzone" counts for "war")
+#
+# word_groups entries can be:
+#   "Category": ("simple", r"regex_pattern")
+#     → uses re.findall directly
+#   "Category": ("fullname", r"full_name_pattern", r"fallback_pattern")
+#     → counts full-name matches first (consuming them), then counts
+#       remaining standalone occurrences via fallback_pattern
+# ─────────────────────────────────────────────
+
+def count_matches(text_lower, category_spec):
+    """
+    category_spec: tuple of ("simple", pattern) or ("fullname", full_pat, fallback_pat)
+    Returns integer count.
+    """
+    if category_spec[0] == "simple":
+        _, pattern = category_spec
+        return len(re.findall(pattern, text_lower, re.IGNORECASE))
+
+    elif category_spec[0] == "fullname":
+        # Full name counts as 1; then count remaining individual names
+        _, full_pat, fallback_pat = category_spec
+        full_matches = re.findall(full_pat, text_lower, re.IGNORECASE)
+        # Remove full-name occurrences from text so they don't double-count
+        scrubbed = re.sub(full_pat, "XXFULLNAMEXX", text_lower, flags=re.IGNORECASE)
+        leftover_matches = re.findall(fallback_pat, scrubbed, re.IGNORECASE)
+        return len(full_matches) + len(leftover_matches)
+
+    return 0
+
 
 # ─────────────────────────────────────────────
 # MARKET CONFIGS
+#
+# Regex rules applied:
+#  - '?s?  →  allows possessive/plural (e.g. "war's", "wars")
+#  - Compounds included via alternation (e.g. warfare|wartime|warzone)
+#  - Full names use "fullname" spec to deduplicate
 # ─────────────────────────────────────────────
 
 MARKET_CONFIGS = {
@@ -45,62 +84,120 @@ MARKET_CONFIGS = {
         "slug": POLYMARKET_SLUG_1,
         "label": "🎬 MrBeast YouTube",
         "word_groups": {
-            "Dollar": r"\bdollar(s)?\b",
-            "Thousand/Million": r"\b(thousand|million|billion)(s)?\b",
-            "Challenge": r"\bchallenge(s)?\b",
-            "Eliminated": r"\beliminated?\b",
-            "Trap": r"\btrap(s)?\b",
-            "Car/Supercar": r"\b(car|supercar)(s)?\b",
-            "Tesla/Lamborghini": r"\b(tesla|lamborghini)(s)?\b",
-            "Helicopter/Jet": r"\b(helicopter|jet)(s)?\b",
-            "Island": r"\bisland(s)?\b",
-            "Mystery Box": r"\bmystery\s+box(es)?\b",
-            "Massive": r"\bmassive\b",
-            "World's Biggest/Largest": r"\bworld'?s?\s+(biggest|largest)\b",
-            "Beast Games": r"\bbeast\s+games\b",
-            "Feastables": r"\bfeastables\b",
-            "MrBeast": r"\bmr\.?\s*beast\b",
-            "Insane": r"\binsane\b",
-            "Subscribe": r"\bsubscrib(e|ed|ing|er|s)?\b",
+            # Plurals and possessives count
+            # dollars, dollar's
+            "Dollar":               ("simple", r"\bdollar'?s?\b"),
+            # thousands, million's, billions
+            "Thousand/Million":     ("simple", r"\b(thousand|million|billion)'?s?\b"),
+            # challenges, challenge's
+            "Challenge":            ("simple", r"\bchallenge'?s?\b"),
+            # eliminated, eliminates — possessive unlikely but covered
+            "Eliminated":           ("simple", r"\beliminate[ds]?\b"),
+            # traps, trap's
+            "Trap":                 ("simple", r"\btraps?'?s?\b"),
+            # cars, car's, supercars, supercar's
+            "Car/Supercar":         ("simple", r"\b(super)?car'?s?\b"),
+            # Tesla's, Lamborghinis, Lamborghini's
+            "Tesla/Lamborghini":    ("simple", r"\b(tesla|lamborghini)'?s?\b"),
+            # helicopters, helicopter's, jets, jet's
+            "Helicopter/Jet":       ("simple", r"\b(helicopter|jet)'?s?\b"),
+            # islands, island's
+            "Island":               ("simple", r"\bisland'?s?\b"),
+            # mystery box, mystery boxes, mystery box's
+            "Mystery Box":          ("simple", r"\bmystery\s+box(?:es|'?s)?\b"),
+            # massive (no meaningful plural/possessive)
+            "Massive":              ("simple", r"\bmassive\b"),
+            # world's biggest / world's largest
+            "World's Biggest/Largest": ("simple", r"\bworld'?s?\s+(biggest|largest)\b"),
+            # beast games, beast game
+            "Beast Games":          ("simple", r"\bbeast\s+games?\b"),
+            # feastables, feastable's
+            "Feastables":           ("simple", r"\bfeastables?'?s?\b"),
+            # MrBeast, Mr Beast, MrBeast's
+            "MrBeast":              ("simple", r"\bmr\.?\s*beast'?s?\b"),
+            # insane (no meaningful plural/possessive)
+            "Insane":               ("simple", r"\binsane\b"),
+            # subscribe, subscribes, subscribed, subscribing, subscriber(s), subscription(s)
+            "Subscribe":            ("simple", r"\bsubscri(?:be'?s?|bed|bing|ber'?s?|ption'?s?)\b"),
         },
-        "thresholds": {
-            "Dollar": 10,
-            "Thousand/Million": 10,
-        },
+        "thresholds": {"Dollar": 10, "Thousand/Million": 10},
         "default_threshold": 1,
         "match_market": "mrbeast",
     },
+
     "joerogan": {
         "slug": POLYMARKET_SLUG_2,
         "label": "🎙️ Joe Rogan Experience",
         "word_groups": {
-            "People": r"\bpeople\b",
-            "Fuck/Fucking": r"\bf+u+c+k+(ing)?\b",
-            "Really": r"\breally\b",
-            "Interesting": r"\binteresting\b",
-            "Jamie": r"\bjamie\b",
-            "Dow Jones": r"\bdow\s+jones\b",
-            "Pam/Bondi": r"\b(pam|bondi)\b",
-            "Trump/MAGA": r"\b(trump|maga)\b",
-            "Epstein": r"\bepstein\b",
-            "DHS": r"\bdhs\b",
-            "Congress": r"\bcongress\b",
-            "Shutdown": r"\bshut\s*down\b",
-            "Shooting": r"\bshooting\b",
-            "War": r"\bwar\b",
-            "Cocaine": r"\bcocaine\b",
-            "Fentanyl": r"\bfentanyl\b",
-            "Terrorist/Terrorism": r"\b(terrorist|terrorism)\b",
-            "Super Bowl/Big Game": r"\b(super\s+bowl|big\s+game)\b",
-            "Olympic/Olympics": r"\bolympic(s)?\b",
-            "Valentine": r"\bvalentine'?s?\b",
+            # people, people's
+            "People":               ("simple", r"\bpeople'?s?\b"),
+
+            # fuck, fucks, fuck's, fucking, fucked, fucker(s) — also compound: fuckwit, fuckhead
+            "Fuck/Fucking":         ("simple", r"\bf+u+c+k(?:s|'?s|ing|ed|er'?s?|wit'?s?|head'?s?)?\b"),
+
+            # really (adverb, no meaningful plural/possessive)
+            "Really":               ("simple", r"\breally\b"),
+
+            # interesting (adjective, no meaningful plural/possessive)
+            "Interesting":          ("simple", r"\binteresting\b"),
+
+            # Jamie, Jamie's
+            "Jamie":                ("simple", r"\bjamie'?s?\b"),
+
+            # Dow Jones, Dow Jones' (possessive)
+            "Dow Jones":            ("simple", r"\bdow\s+jones'?\b"),
+
+            # "Pam Bondi" counts as ONE mention (fullname rule)
+            # Fallback catches standalone Pam or Bondi
+            "Pam/Bondi":            ("fullname",
+                                     r"\bpam\s+bondi'?s?\b",
+                                     r"\b(?:pam|bondi)'?s?\b"),
+
+            # Trump, Trump's, Trumpism, Trumpist, Trumpian + MAGA
+            "Trump/MAGA":           ("simple", r"\btrump(?:'?s|ism|ist|ian)?\b|\bmaga\b"),
+
+            # Epstein, Epstein's
+            "Epstein":              ("simple", r"\bepstein'?s?\b"),
+
+            # DHS, DHS's
+            "DHS":                  ("simple", r"\bdhs'?s?\b"),
+
+            # Congress, Congress's, congressional, congressman/woman/person/people
+            "Congress":             ("simple", r"\bcongress(?:'?s|ional|man|woman|person|people)?\b"),
+
+            # shutdown, shutdowns, shut down
+            "Shutdown":             ("simple", r"\bshutdowns?'?s?\b|\bshut\s+down\b"),
+
+            # shooting, shootings, shooting's
+            "Shooting":             ("simple", r"\bshooting'?s?\b"),
+
+            # war, wars, war's + compounds: warfare, wartime, warzone, warlord, warhead, warmonger
+            "War":                  ("simple", r"\bwars?'?s?\b|\bwar(?:fare|time|zone|lord|head|monger|torn|path|ring)'?s?\b"),
+
+            # cocaine, cocaine's
+            "Cocaine":              ("simple", r"\bcocaine'?s?\b"),
+
+            # fentanyl, fentanyl's
+            "Fentanyl":             ("simple", r"\bfentanyl'?s?\b"),
+
+            # terrorist(s), terrorist's, terrorism + compounds: counter-terrorist, anti-terrorism
+            "Terrorist/Terrorism":  ("simple", r"\bterrorists?'?s?\b|\bterrorism'?s?\b|\b(?:counter|anti)[\s\-]terror(?:ist'?s?|ism'?s?)?\b"),
+
+            # Super Bowl, Super Bowl's, Big Game, Big Game's
+            "Super Bowl/Big Game":  ("simple", r"\bsuper\s+bowl'?s?\b|\bbig\s+game'?s?\b"),
+
+            # Olympic, Olympics, Olympic's
+            "Olympic/Olympics":     ("simple", r"\bolympic'?s?\b"),
+
+            # Valentine, Valentine's, Valentines
+            "Valentine":            ("simple", r"\bvalentine'?s?\b"),
         },
         "thresholds": {
-            "People": 100,
-            "Fuck/Fucking": 20,
-            "Really": 10,
-            "Interesting": 5,
-            "Jamie": 5,
+            "People":       100,
+            "Fuck/Fucking":  20,
+            "Really":        10,
+            "Interesting":    5,
+            "Jamie":          5,
         },
         "default_threshold": 1,
         "match_market": "joerogan",
@@ -289,7 +386,7 @@ def get_polymarket_data(slug, match_fn, word_groups):
         markets = event.get("markets", [])
 
         if not markets:
-            print("⚠️  No markets found in event!")
+            print("⚠️  No markets found!")
             return None, None
 
         print(f"✅ Found {len(markets)} markets\n")
@@ -335,12 +432,9 @@ def get_polymarket_data(slug, match_fn, word_groups):
             print()
 
         print(f"📊 Summary: {len(prices)} with prices, {len(token_ids)} categories with tokens\n")
-        all_categories = set(word_groups.keys())
-        missing_categories = all_categories - set(prices.keys())
-        if missing_categories:
-            print(f"⚠️  Categories NOT found in Polymarket:")
-            for cat in sorted(missing_categories):
-                print(f"   - {cat}")
+        missing = set(word_groups.keys()) - set(prices.keys())
+        if missing:
+            print(f"⚠️  Missing from Polymarket: {', '.join(sorted(missing))}")
 
         return prices, token_ids
 
@@ -364,7 +458,9 @@ def format_results(text_lower, market_key):
     match_fn = MARKET_MATCHERS[config["match_market"]]
 
     thresholds = {cat: thresholds_map.get(cat, default_thresh) for cat in word_groups}
-    counts = {cat: len(re.findall(pattern, text_lower)) for cat, pattern in word_groups.items()}
+
+    # Count using the rule-aware engine
+    counts = {cat: count_matches(text_lower, spec) for cat, spec in word_groups.items()}
     sorted_counts = dict(sorted(counts.items()))
     total = sum(sorted_counts.values())
 
@@ -459,14 +555,13 @@ def format_results(text_lower, market_key):
                         trade_results.append(f"✅ {cat[:14]} {side} ${actual_trade_amt}")
                         time.sleep(0.5)
                     else:
-                        error = resp.get('error') or resp.get('errorMsg') or resp.get('message', 'No fill')
                         trade_results.append(f"⚠️ {cat[:14]} {side} No fill")
                 except Exception as e:
                     trade_results.append(f"❌ {cat[:14]} {side} Error")
                     time.sleep(0.5)
         except Exception as e:
             print(f"\n❌ Trading setup failed: {e}")
-            trade_results.append(f"❌ Setup failed")
+            trade_results.append("❌ Setup failed")
 
     result = f"<b>Polymarket Sniper 🚀</b>\n\n{msg}{poly_section}"
     if trade_results:
@@ -508,8 +603,7 @@ def send_welcome(message):
 
 @bot.message_handler(commands=['market1'])
 def select_market1(message):
-    chat_id = message.chat.id
-    user_market_selection[chat_id] = "mrbeast"
+    user_market_selection[message.chat.id] = "mrbeast"
     config = MARKET_CONFIGS["mrbeast"]
     bot.reply_to(
         message,
@@ -522,8 +616,7 @@ def select_market1(message):
 
 @bot.message_handler(commands=['market2'])
 def select_market2(message):
-    chat_id = message.chat.id
-    user_market_selection[chat_id] = "joerogan"
+    user_market_selection[message.chat.id] = "joerogan"
     config = MARKET_CONFIGS["joerogan"]
     bot.reply_to(
         message,
@@ -539,14 +632,15 @@ def show_market_menu(message):
     chat_id = message.chat.id
     current = user_market_selection.get(chat_id, None)
     current_label = MARKET_CONFIGS[current]['label'] if current else "None selected"
-    text = (
+    bot.reply_to(
+        message,
         f"<b>🔀 Market Selection</b>\n\n"
         f"Current: <b>{current_label}</b>\n\n"
         f"Switch to:\n"
         f"• /market1 → 🎬 MrBeast YouTube\n"
-        f"• /market2 → 🎙️ Joe Rogan Experience"
+        f"• /market2 → 🎙️ Joe Rogan Experience",
+        parse_mode='HTML'
     )
-    bot.reply_to(message, text, parse_mode='HTML')
 
 
 def prompt_market_selection(message):

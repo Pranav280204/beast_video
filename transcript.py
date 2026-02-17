@@ -1,217 +1,76 @@
 import os
 import re
+import threading
+import time
+import json
+import hashlib
 import requests
 import telebot
-import hashlib
-import json
+from telebot import types
 from ecdsa import SigningKey, SECP256k1
-import time
 
-# Polymarket trading (only if AUTO_TRADE enabled)
+# ─────────────────────────────────────────────
+# OPTIONAL AUTO-TRADE IMPORTS
+# ─────────────────────────────────────────────
 if os.environ.get("AUTO_TRADE", "false").lower() == "true":
     from py_clob_client.client import ClobClient
-    from py_clob_client.clob_types import MarketOrderArgs, OrderArgs
+    from py_clob_client.clob_types import MarketOrderArgs, OrderType
     from py_clob_client.order_builder.constants import BUY
-    from py_clob_client.clob_types import OrderType
 
-# Environment variables
-BOT_TOKEN = os.environ.get("BOT_TOKEN")
-API_TOKEN = os.environ.get("API_TOKEN")
-PRIVATE_KEY = os.environ.get("PRIVATE_KEY")
-WALLET_ADDRESS = os.environ.get("WALLET_ADDRESS")
-AUTO_TRADE = os.environ.get("AUTO_TRADE", "false").lower() == "true"
-TRADE_AMOUNT = float(os.environ.get("TRADE_AMOUNT", "10"))
-MIN_TRADE_AMOUNT = float(os.environ.get("MIN_TRADE_AMOUNT", "1"))
+# ─────────────────────────────────────────────
+# ENVIRONMENT VARIABLES
+# ─────────────────────────────────────────────
+BOT_TOKEN          = os.environ.get("BOT_TOKEN")
+API_TOKEN          = os.environ.get("API_TOKEN")           # youtube-transcript.io Basic token
+YOUTUBE_API_KEY    = os.environ.get("YOUTUBE_API_KEY")     # Google Data API v3 key
+PRIVATE_KEY        = os.environ.get("PRIVATE_KEY")
+WALLET_ADDRESS     = os.environ.get("WALLET_ADDRESS")
+AUTO_TRADE         = os.environ.get("AUTO_TRADE", "false").lower() == "true"
+TRADE_AMOUNT       = float(os.environ.get("TRADE_AMOUNT", "10"))
+MIN_TRADE_AMOUNT   = float(os.environ.get("MIN_TRADE_AMOUNT", "1"))
+POLL_INTERVAL      = int(os.environ.get("POLL_INTERVAL", "60"))   # seconds between checks
 
-POLYMARKET_SLUG_1 = os.environ.get("POLYMARKET_SLUG", "what-will-mrbeast-say-during-his-next-youtube-video").strip()
-POLYMARKET_SLUG_2 = os.environ.get("POLYMARKET_SLUG_2", "what-will-be-said-on-the-first-joe-rogan-experience-episode-of-the-week-february-22").strip()
+POLYMARKET_SLUG_1  = os.environ.get("POLYMARKET_SLUG",  "what-will-mrbeast-say-during-his-next-youtube-video").strip()
+POLYMARKET_SLUG_2  = os.environ.get("POLYMARKET_SLUG_2","what-will-be-said-on-the-first-joe-rogan-experience-episode-of-the-week-february-22").strip()
 
 if not BOT_TOKEN:
     print("ERROR: BOT_TOKEN not set!")
     exit(1)
 
 bot = telebot.TeleBot(BOT_TOKEN)
-user_market_selection = {}
-
 
 # ─────────────────────────────────────────────
-# COUNTING ENGINE
-# Rules:
-#  1. Plurals/possessives count
-#  2. Full-name mention counts as ONE (e.g. "Pam Bondi" = 1, not 2)
-#  3. Compound words count (e.g. "warzone" counts for "war")
-#
-# word_groups entries can be:
-#   "Category": ("simple", r"regex_pattern")
-#     → uses re.findall directly
-#   "Category": ("fullname", r"full_name_pattern", r"fallback_pattern")
-#     → counts full-name matches first (consuming them), then counts
-#       remaining standalone occurrences via fallback_pattern
+# CHANNEL METADATA
 # ─────────────────────────────────────────────
-
-def count_matches(text_lower, category_spec):
-    """
-    category_spec: tuple of ("simple", pattern) or ("fullname", full_pat, fallback_pat)
-    Returns integer count.
-    """
-    if category_spec[0] == "simple":
-        _, pattern = category_spec
-        return len(re.findall(pattern, text_lower, re.IGNORECASE))
-
-    elif category_spec[0] == "fullname":
-        # Full name counts as 1; then count remaining individual names
-        _, full_pat, fallback_pat = category_spec
-        full_matches = re.findall(full_pat, text_lower, re.IGNORECASE)
-        # Remove full-name occurrences from text so they don't double-count
-        scrubbed = re.sub(full_pat, "XXFULLNAMEXX", text_lower, flags=re.IGNORECASE)
-        leftover_matches = re.findall(fallback_pat, scrubbed, re.IGNORECASE)
-        return len(full_matches) + len(leftover_matches)
-
-    return 0
-
-
-# ─────────────────────────────────────────────
-# MARKET CONFIGS
-#
-# Regex rules applied:
-#  - '?s?  →  allows possessive/plural (e.g. "war's", "wars")
-#  - Compounds included via alternation (e.g. warfare|wartime|warzone)
-#  - Full names use "fullname" spec to deduplicate
-# ─────────────────────────────────────────────
-
-MARKET_CONFIGS = {
-    "mrbeast": {
-        "slug": POLYMARKET_SLUG_1,
-        "label": "🎬 MrBeast YouTube",
-        "word_groups": {
-            # Plurals and possessives count
-            # dollars, dollar's
-            "Dollar":               ("simple", r"\bdollar'?s?\b"),
-            # thousands, million's, billions
-            "Thousand/Million":     ("simple", r"\b(thousand|million|billion)'?s?\b"),
-            # challenges, challenge's
-            "Challenge":            ("simple", r"\bchallenge'?s?\b"),
-            # eliminated, eliminates — possessive unlikely but covered
-            "Eliminated":           ("simple", r"\beliminate[ds]?\b"),
-            # traps, trap's
-            "Trap":                 ("simple", r"\btraps?'?s?\b"),
-            # cars, car's, supercars, supercar's
-            "Car/Supercar":         ("simple", r"\b(super)?car'?s?\b"),
-            # Tesla's, Lamborghinis, Lamborghini's
-            "Tesla/Lamborghini":    ("simple", r"\b(tesla|lamborghini)'?s?\b"),
-            # helicopters, helicopter's, jets, jet's
-            "Helicopter/Jet":       ("simple", r"\b(helicopter|jet)'?s?\b"),
-            # islands, island's
-            "Island":               ("simple", r"\bisland'?s?\b"),
-            # mystery box, mystery boxes, mystery box's
-            "Mystery Box":          ("simple", r"\bmystery\s+box(?:es|'?s)?\b"),
-            # massive (no meaningful plural/possessive)
-            "Massive":              ("simple", r"\bmassive\b"),
-            # world's biggest / world's largest
-            "World's Biggest/Largest": ("simple", r"\bworld'?s?\s+(biggest|largest)\b"),
-            # beast games, beast game
-            "Beast Games":          ("simple", r"\bbeast\s+games?\b"),
-            # feastables, feastable's
-            "Feastables":           ("simple", r"\bfeastables?'?s?\b"),
-            # MrBeast, Mr Beast, MrBeast's
-            "MrBeast":              ("simple", r"\bmr\.?\s*beast'?s?\b"),
-            # insane (no meaningful plural/possessive)
-            "Insane":               ("simple", r"\binsane\b"),
-            # subscribe, subscribes, subscribed, subscribing, subscriber(s), subscription(s)
-            "Subscribe":            ("simple", r"\bsubscri(?:be'?s?|bed|bing|ber'?s?|ption'?s?)\b"),
-        },
-        "thresholds": {"Dollar": 10, "Thousand/Million": 10},
-        "default_threshold": 1,
-        "match_market": "mrbeast",
+CHANNELS = {
+    "mrbeast":  {
+        "channel_id":  "UCX6OQ3DkcsbYNE6H8uQQuVA",
+        "handle":      "@MrBeast",
+        "label":       "🎬 MrBeast YouTube",
     },
-
     "joerogan": {
-        "slug": POLYMARKET_SLUG_2,
-        "label": "🎙️ Joe Rogan Experience",
-        "word_groups": {
-            # people, people's
-            "People":               ("simple", r"\bpeople'?s?\b"),
-
-            # fuck, fucks, fuck's, fucking, fucked, fucker(s) — also compound: fuckwit, fuckhead
-            # Bleeped form: [ __ ] — on JRE transcripts the VAST MAJORITY of bleeps are
-            # fuck/fucking variants. Counting all [ __ ] is the most accurate approach
-            # since: (a) JRE is known for heavy fuck usage, (b) the threshold is 20+ so
-            # minor overcounting of occasional "shit" bleeps doesn't affect YES/NO outcome,
-            # (c) the market resolver watches actual video — this is our closest proxy.
-            "Fuck/Fucking":         ("simple",
-                r"\bf+u+c+k(?:s|'?s|ing|ed|er'?s?|wit'?s?|head'?s?)?\b"
-                r"|\[\s*__\s*\]"                                         # ALL bleeps (overwhelmingly fuck on JRE)
-                r"|mother\[\s*__\s*\](?:ing|er'?s?)?"                   # mother[ __ ]ing (explicit form)
-            ),
-
-            # really (adverb, no meaningful plural/possessive)
-            "Really":               ("simple", r"\breally\b"),
-
-            # interesting (adjective, no meaningful plural/possessive)
-            "Interesting":          ("simple", r"\binteresting\b"),
-
-            # Jamie, Jamie's
-            "Jamie":                ("simple", r"\bjamie'?s?\b"),
-
-            # Dow Jones, Dow Jones' (possessive)
-            "Dow Jones":            ("simple", r"\bdow\s+jones'?\b"),
-
-            # "Pam Bondi" counts as ONE mention (fullname rule)
-            # Fallback catches standalone Pam or Bondi
-            "Pam/Bondi":            ("fullname",
-                                     r"\bpam\s+bondi'?s?\b",
-                                     r"\b(?:pam|bondi)'?s?\b"),
-
-            # Trump, Trump's, Trumpism, Trumpist, Trumpian + MAGA
-            "Trump/MAGA":           ("simple", r"\btrump(?:'?s|ism|ist|ian)?\b|\bmaga\b"),
-
-            # Epstein, Epstein's
-            "Epstein":              ("simple", r"\bepstein'?s?\b"),
-
-            # DHS, DHS's
-            "DHS":                  ("simple", r"\bdhs'?s?\b"),
-
-            # Congress, Congress's, congressional, congressman/woman/person/people
-            "Congress":             ("simple", r"\bcongress(?:'?s|ional|man|woman|person|people)?\b"),
-
-            # shutdown, shutdowns, shut down
-            "Shutdown":             ("simple", r"\bshutdowns?'?s?\b|\bshut\s+down\b"),
-
-            # shooting, shootings, shooting's
-            "Shooting":             ("simple", r"\bshooting'?s?\b"),
-
-            # war, wars, war's + compounds: warfare, wartime, warzone, warlord, warhead, warmonger
-            "War":                  ("simple", r"\bwars?'?s?\b|\bwar(?:fare|time|zone|lord|head|monger|torn|path|ring)'?s?\b"),
-
-            # cocaine, cocaine's
-            "Cocaine":              ("simple", r"\bcocaine'?s?\b"),
-
-            # fentanyl, fentanyl's
-            "Fentanyl":             ("simple", r"\bfentanyl'?s?\b"),
-
-            # terrorist(s), terrorist's, terrorism + compounds: counter-terrorist, anti-terrorism
-            "Terrorist/Terrorism":  ("simple", r"\bterrorists?'?s?\b|\bterrorism'?s?\b|\b(?:counter|anti)[\s\-]terror(?:ist'?s?|ism'?s?)?\b"),
-
-            # Super Bowl, Super Bowl's, Big Game, Big Game's
-            "Super Bowl/Big Game":  ("simple", r"\bsuper\s+bowl'?s?\b|\bbig\s+game'?s?\b"),
-
-            # Olympic, Olympics, Olympic's
-            "Olympic/Olympics":     ("simple", r"\bolympic'?s?\b"),
-
-            # Valentine, Valentine's, Valentines
-            "Valentine":            ("simple", r"\bvalentine'?s?\b"),
-        },
-        "thresholds": {
-            "People":       100,
-            "Fuck/Fucking":  20,
-            "Really":        10,
-            "Interesting":    5,
-            "Jamie":          5,
-        },
-        "default_threshold": 1,
-        "match_market": "joerogan",
+        "channel_id":  "UCzWQYUVCpZqtN93H8RR44Qw",
+        "handle":      "@joerogan",
+        "label":       "🎙️ Joe Rogan Experience",
+    },
+    "souravjoshi": {
+        "channel_id":  "UCH-0f3dhAQS9r1Yg3Wl1xJQ",
+        "handle":      "@SouravJoshiVlogs",
+        "label":       "🇮🇳 Sourav Joshi Vlogs (Testing)",
+        "testing":     True,
     },
 }
+
+# ─────────────────────────────────────────────
+# USER STATE
+# Format per chat_id:
+#   market_key       – selected market
+#   mode             – "ask_monitor" | "monitoring" | "awaiting_link" | "ask_testing"
+#   testing          – bool (for souravjoshi)
+#   monitor_thread   – threading.Thread or None
+#   stop_event       – threading.Event or None
+# ─────────────────────────────────────────────
+user_state: dict[int, dict] = {}
 
 
 # ─────────────────────────────────────────────
@@ -219,36 +78,37 @@ MARKET_CONFIGS = {
 # ─────────────────────────────────────────────
 
 def derive_address(private_key: str) -> str:
-    pk = private_key[2:] if private_key.startswith('0x') else private_key
-    priv_key_bytes = bytes.fromhex(pk)
-    sk = SigningKey.from_string(priv_key_bytes, curve=SECP256k1)
-    vk = sk.verifying_key
-    uncompressed_pub_key = b'\x04' + vk.to_string()
-    keccak = hashlib.sha3_256(uncompressed_pub_key).digest()
-    return '0x' + keccak[-20:].hex()
+    pk = private_key[2:] if private_key.startswith("0x") else private_key
+    sk  = SigningKey.from_string(bytes.fromhex(pk), curve=SECP256k1)
+    vk  = sk.verifying_key
+    pub = b"\x04" + vk.to_string()
+    keccak = hashlib.sha3_256(pub).digest()
+    return "0x" + keccak[-20:].hex()
 
 if PRIVATE_KEY and not WALLET_ADDRESS:
     WALLET_ADDRESS = derive_address(PRIVATE_KEY)
 
-def extract_video_id(user_input):
+
+def extract_video_id(user_input: str) -> str | None:
     patterns = [
-        r'(?:v=|\/embed\/|\/shorts\/|\/watch\?v=|youtu\.be\/)([0-9A-Za-z_-]{11})',
-        r'^([0-9A-Za-z_-]{11})$'
+        r"(?:v=|\/embed\/|\/shorts\/|\/watch\?v=|youtu\.be\/)([0-9A-Za-z_-]{11})",
+        r"^([0-9A-Za-z_-]{11})$",
     ]
-    for pattern in patterns:
-        match = re.search(pattern, user_input)
-        if match:
-            return match.group(1)
+    for p in patterns:
+        m = re.search(p, user_input)
+        if m:
+            return m.group(1)
     return None
 
-def extract_transcript_text(data):
-    text_parts = []
+
+def extract_transcript_text(data) -> str:
+    parts = []
     def collect(obj):
         if isinstance(obj, str):
-            text_parts.append(obj)
+            parts.append(obj)
         elif isinstance(obj, dict):
-            if 'text' in obj and isinstance(obj['text'], str):
-                text_parts.append(obj['text'])
+            if "text" in obj and isinstance(obj["text"], str):
+                parts.append(obj["text"])
             else:
                 for v in obj.values():
                     collect(v)
@@ -256,128 +116,277 @@ def extract_transcript_text(data):
             for item in obj:
                 collect(item)
     collect(data)
-    return " ".join(text_parts)
+    return " ".join(parts)
 
-def get_token_id_for_outcome(market, target_outcome):
+
+def fetch_transcript(video_id: str) -> str | None:
+    """Fetch transcript from youtube-transcript.io."""
+    if not API_TOKEN:
+        return None
+    try:
+        url     = "https://www.youtube-transcript.io/api/transcripts"
+        headers = {"Authorization": f"Basic {API_TOKEN}", "Content-Type": "application/json"}
+        r       = requests.post(url, headers=headers, json={"ids": [video_id]}, timeout=30)
+        r.raise_for_status()
+        text = extract_transcript_text(r.json())
+        return text if text.strip() else None
+    except Exception as e:
+        print(f"❌ Transcript fetch error: {e}")
+        return None
+
+
+def get_token_id_for_outcome(market, target_outcome: str) -> str | None:
     target = target_outcome.lower()
-    tokens = market.get("tokens", [])
-    for token in tokens:
+    for token in market.get("tokens", []):
         if token.get("outcome", "").lower() == target:
             tid = token.get("token_id")
             if tid is not None:
                 return str(tid)
     outcomes_raw = market.get("outcomes", [])
     if isinstance(outcomes_raw, str):
-        try:
-            outcomes = json.loads(outcomes_raw)
-        except:
-            outcomes = []
+        try:    outcomes = json.loads(outcomes_raw)
+        except: outcomes = []
     else:
         outcomes = outcomes_raw or []
     clob_ids_raw = market.get("clobTokenIds", []) or market.get("clob_token_ids", [])
     if isinstance(clob_ids_raw, str):
-        try:
-            clob_ids = json.loads(clob_ids_raw)
-        except:
-            clob_ids = []
+        try:    clob_ids = json.loads(clob_ids_raw)
+        except: clob_ids = []
     else:
         clob_ids = clob_ids_raw or []
     for idx, outcome in enumerate(outcomes):
-        if str(outcome).lower() == target:
-            if idx < len(clob_ids):
-                tid = clob_ids[idx]
-                if tid is not None:
-                    return str(tid)
+        if str(outcome).lower() == target and idx < len(clob_ids):
+            return str(clob_ids[idx])
     return None
+
+
+# ─────────────────────────────────────────────
+# YOUTUBE DATA API — LATEST NON-SHORT VIDEO
+# ─────────────────────────────────────────────
+
+def get_latest_video(channel_id: str) -> dict | None:
+    """Return latest non-Shorts video dict or None."""
+    if not YOUTUBE_API_KEY:
+        print("⚠️  YOUTUBE_API_KEY not set – cannot poll YouTube.")
+        return None
+    try:
+        url = "https://www.googleapis.com/youtube/v3/search"
+        params = {
+            "key":        YOUTUBE_API_KEY,
+            "channelId":  channel_id,
+            "part":       "snippet",
+            "order":      "date",
+            "type":       "video",
+            "maxResults": 5,
+        }
+        r = requests.get(url, params=params, timeout=15)
+        r.raise_for_status()
+        items = r.json().get("items", [])
+        for item in items:
+            vid_id = item["id"]["videoId"]
+            title  = item["snippet"]["title"]
+            # Exclude Shorts by checking duration via videos endpoint
+            if not is_short(vid_id):
+                return {"video_id": vid_id, "title": title}
+        return None
+    except Exception as e:
+        print(f"❌ YouTube search error: {e}")
+        return None
+
+
+def is_short(video_id: str) -> bool:
+    """Return True if the video is a YouTube Short (≤ 60 s)."""
+    if not YOUTUBE_API_KEY:
+        return False
+    try:
+        url = "https://www.googleapis.com/youtube/v3/videos"
+        params = {"key": YOUTUBE_API_KEY, "id": video_id, "part": "contentDetails"}
+        r = requests.get(url, params=params, timeout=10)
+        r.raise_for_status()
+        items = r.json().get("items", [])
+        if not items:
+            return False
+        duration = items[0]["contentDetails"]["duration"]   # ISO 8601
+        # Parse PT#M#S — Shorts are ≤ 60 seconds
+        total_sec = parse_iso8601_duration(duration)
+        return total_sec <= 60
+    except:
+        return False
+
+
+def parse_iso8601_duration(duration: str) -> int:
+    """Convert ISO 8601 duration string to total seconds."""
+    m = re.match(r"PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?", duration)
+    if not m:
+        return 0
+    h, mi, s = (int(x or 0) for x in m.groups())
+    return h * 3600 + mi * 60 + s
+
+
+# ─────────────────────────────────────────────
+# COUNTING ENGINE
+# ─────────────────────────────────────────────
+
+def count_matches(text_lower: str, category_spec: tuple) -> int:
+    if category_spec[0] == "simple":
+        _, pattern = category_spec
+        return len(re.findall(pattern, text_lower, re.IGNORECASE))
+    elif category_spec[0] == "fullname":
+        _, full_pat, fallback_pat = category_spec
+        full_matches = re.findall(full_pat, text_lower, re.IGNORECASE)
+        scrubbed = re.sub(full_pat, "XXFULLNAMEXX", text_lower, flags=re.IGNORECASE)
+        leftover = re.findall(fallback_pat, scrubbed, re.IGNORECASE)
+        return len(full_matches) + len(leftover)
+    return 0
+
+
+# ─────────────────────────────────────────────
+# MARKET CONFIGS
+# ─────────────────────────────────────────────
+
+MARKET_CONFIGS = {
+    "mrbeast": {
+        "slug":  POLYMARKET_SLUG_1,
+        "label": "🎬 MrBeast YouTube",
+        "channel_key": "mrbeast",
+        "testing": False,
+        "word_groups": {
+            "Dollar":                   ("simple", r"\bdollar'?s?\b"),
+            "Thousand/Million":         ("simple", r"\b(thousand|million|billion)'?s?\b"),
+            "Challenge":                ("simple", r"\bchallenge'?s?\b"),
+            "Eliminated":               ("simple", r"\beliminate[ds]?\b"),
+            "Trap":                     ("simple", r"\btraps?'?s?\b"),
+            "Car/Supercar":             ("simple", r"\b(super)?car'?s?\b"),
+            "Tesla/Lamborghini":        ("simple", r"\b(tesla|lamborghini)'?s?\b"),
+            "Helicopter/Jet":           ("simple", r"\b(helicopter|jet)'?s?\b"),
+            "Island":                   ("simple", r"\bisland'?s?\b"),
+            "Mystery Box":              ("simple", r"\bmystery\s+box(?:es|'?s)?\b"),
+            "Massive":                  ("simple", r"\bmassive\b"),
+            "World's Biggest/Largest":  ("simple", r"\bworld'?s?\s+(biggest|largest)\b"),
+            "Beast Games":              ("simple", r"\bbeast\s+games?\b"),
+            "Feastables":               ("simple", r"\bfeastables?'?s?\b"),
+            "MrBeast":                  ("simple", r"\bmr\.?\s*beast'?s?\b"),
+            "Insane":                   ("simple", r"\binsane\b"),
+            "Subscribe":                ("simple", r"\bsubscri(?:be'?s?|bed|bing|ber'?s?|ption'?s?)\b"),
+        },
+        "thresholds": {"Dollar": 10, "Thousand/Million": 10},
+        "default_threshold": 1,
+        "match_market": "mrbeast",
+    },
+
+    "joerogan": {
+        "slug":  POLYMARKET_SLUG_2,
+        "label": "🎙️ Joe Rogan Experience",
+        "channel_key": "joerogan",
+        "testing": False,
+        "word_groups": {
+            "People":               ("simple", r"\bpeople'?s?\b"),
+            "Fuck/Fucking":         ("simple",
+                r"\bf+u+c+k(?:s|'?s|ing|ed|er'?s?|wit'?s?|head'?s?)?\b"
+                r"|\[\s*__\s*\]"
+                r"|mother\[\s*__\s*\](?:ing|er'?s?)?"),
+            "Really":               ("simple", r"\breally\b"),
+            "Interesting":          ("simple", r"\binteresting\b"),
+            "Jamie":                ("simple", r"\bjamie'?s?\b"),
+            "Dow Jones":            ("simple", r"\bdow\s+jones'?\b"),
+            "Pam/Bondi":            ("fullname", r"\bpam\s+bondi'?s?\b", r"\b(?:pam|bondi)'?s?\b"),
+            "Trump/MAGA":           ("simple", r"\btrump(?:'?s|ism|ist|ian)?\b|\bmaga\b"),
+            "Epstein":              ("simple", r"\bepstein'?s?\b"),
+            "DHS":                  ("simple", r"\bdhs'?s?\b"),
+            "Congress":             ("simple", r"\bcongress(?:'?s|ional|man|woman|person|people)?\b"),
+            "Shutdown":             ("simple", r"\bshutdowns?'?s?\b|\bshut\s+down\b"),
+            "Shooting":             ("simple", r"\bshooting'?s?\b"),
+            "War":                  ("simple", r"\bwars?'?s?\b|\bwar(?:fare|time|zone|lord|head|monger|torn|path|ring)'?s?\b"),
+            "Cocaine":              ("simple", r"\bcocaine'?s?\b"),
+            "Fentanyl":             ("simple", r"\bfentanyl'?s?\b"),
+            "Terrorist/Terrorism":  ("simple", r"\bterrorists?'?s?\b|\bterrorism'?s?\b|\b(?:counter|anti)[\s\-]terror(?:ist'?s?|ism'?s?)?\b"),
+            "Super Bowl/Big Game":  ("simple", r"\bsuper\s+bowl'?s?\b|\bbig\s+game'?s?\b"),
+            "Olympic/Olympics":     ("simple", r"\bolympic'?s?\b"),
+            "Valentine":            ("simple", r"\bvalentine'?s?\b"),
+        },
+        "thresholds": {
+            "People":      100,
+            "Fuck/Fucking": 20,
+            "Really":       10,
+            "Interesting":   5,
+            "Jamie":         5,
+        },
+        "default_threshold": 1,
+        "match_market": "joerogan",
+    },
+
+    # ── TESTING ONLY — no Polymarket slug ──────────────────────────────────
+    "souravjoshi": {
+        "slug":  None,
+        "label": "🇮🇳 Sourav Joshi Vlogs (Testing)",
+        "channel_key": "souravjoshi",
+        "testing": True,
+        "word_groups": {
+            "अवंतिका": ("simple", r"अवंतिका"),
+        },
+        "thresholds": {},
+        "default_threshold": 1,
+        "match_market": "souravjoshi",
+    },
+}
 
 
 # ─────────────────────────────────────────────
 # MARKET MATCHING FUNCTIONS
 # ─────────────────────────────────────────────
 
-def match_market_mrbeast(question_lower):
-    if "beast games" in question_lower:
-        return "Beast Games"
-    if "mystery box" in question_lower:
-        return "Mystery Box"
-    if "world's biggest" in question_lower or "world's largest" in question_lower:
-        return "World's Biggest/Largest"
-    if "tesla" in question_lower and "lamborghini" in question_lower:
-        return "Tesla/Lamborghini"
-    if "helicopter" in question_lower and "jet" in question_lower:
-        return "Helicopter/Jet"
-    if "car" in question_lower and "supercar" in question_lower:
-        return "Car/Supercar"
-    if ("thousand" in question_lower or "million" in question_lower) and "10+" in question_lower:
-        return "Thousand/Million"
-    if "dollar" in question_lower and "10+" in question_lower:
-        return "Dollar"
-    if "subscribe" in question_lower:
-        return "Subscribe"
-    if "insane" in question_lower:
-        return "Insane"
-    if "feastables" in question_lower:
-        return "Feastables"
-    if "mrbeast" in question_lower or "mr beast" in question_lower:
-        return "MrBeast"
-    if "eliminated" in question_lower:
-        return "Eliminated"
-    if "challenge" in question_lower:
-        return "Challenge"
-    if "massive" in question_lower:
-        return "Massive"
-    if "island" in question_lower:
-        return "Island"
-    if "trap" in question_lower:
-        return "Trap"
+def match_market_mrbeast(q):
+    ql = q.lower()
+    if "beast games"  in ql: return "Beast Games"
+    if "mystery box"  in ql: return "Mystery Box"
+    if "world's biggest" in ql or "world's largest" in ql: return "World's Biggest/Largest"
+    if "tesla" in ql and "lamborghini" in ql:              return "Tesla/Lamborghini"
+    if "helicopter" in ql and "jet" in ql:                 return "Helicopter/Jet"
+    if "car" in ql and "supercar" in ql:                   return "Car/Supercar"
+    if ("thousand" in ql or "million" in ql) and "10+" in ql: return "Thousand/Million"
+    if "dollar" in ql and "10+" in ql:                     return "Dollar"
+    if "subscribe"  in ql: return "Subscribe"
+    if "insane"     in ql: return "Insane"
+    if "feastables" in ql: return "Feastables"
+    if "mrbeast" in ql or "mr beast" in ql:                return "MrBeast"
+    if "eliminated" in ql: return "Eliminated"
+    if "challenge"  in ql: return "Challenge"
+    if "massive"    in ql: return "Massive"
+    if "island"     in ql: return "Island"
+    if "trap"       in ql: return "Trap"
     return None
 
-def match_market_joerogan(question_lower):
-    if "valentine" in question_lower:
-        return "Valentine"
-    if "people" in question_lower and "100+" in question_lower:
-        return "People"
-    if ("fuck" in question_lower or "fucking" in question_lower) and "20+" in question_lower:
-        return "Fuck/Fucking"
-    if "really" in question_lower and "10+" in question_lower:
-        return "Really"
-    if "interesting" in question_lower and "5+" in question_lower:
-        return "Interesting"
-    if "jamie" in question_lower and "5+" in question_lower:
-        return "Jamie"
-    if "dow jones" in question_lower or ("dow" in question_lower and "jones" in question_lower):
-        return "Dow Jones"
-    if "pam" in question_lower or "bondi" in question_lower:
-        return "Pam/Bondi"
-    if "trump" in question_lower or "maga" in question_lower:
-        return "Trump/MAGA"
-    if "epstein" in question_lower:
-        return "Epstein"
-    if "dhs" in question_lower:
-        return "DHS"
-    if "congress" in question_lower:
-        return "Congress"
-    if "shutdown" in question_lower or "shut down" in question_lower:
-        return "Shutdown"
-    if "shooting" in question_lower:
-        return "Shooting"
-    if "war" in question_lower:
-        return "War"
-    if "cocaine" in question_lower:
-        return "Cocaine"
-    if "fentanyl" in question_lower:
-        return "Fentanyl"
-    if "terrorist" in question_lower or "terrorism" in question_lower:
-        return "Terrorist/Terrorism"
-    if "super bowl" in question_lower or "big game" in question_lower:
-        return "Super Bowl/Big Game"
-    if "olympic" in question_lower:
-        return "Olympic/Olympics"
+def match_market_joerogan(q):
+    ql = q.lower()
+    if "valentine" in ql:                                   return "Valentine"
+    if "people" in ql and "100+" in ql:                     return "People"
+    if ("fuck" in ql or "fucking" in ql) and "20+" in ql:  return "Fuck/Fucking"
+    if "really" in ql and "10+" in ql:                      return "Really"
+    if "interesting" in ql and "5+" in ql:                  return "Interesting"
+    if "jamie" in ql and "5+" in ql:                        return "Jamie"
+    if "dow jones" in ql or ("dow" in ql and "jones" in ql): return "Dow Jones"
+    if "pam" in ql or "bondi" in ql:                        return "Pam/Bondi"
+    if "trump" in ql or "maga" in ql:                       return "Trump/MAGA"
+    if "epstein" in ql:                                      return "Epstein"
+    if "dhs"     in ql:                                      return "DHS"
+    if "congress" in ql:                                     return "Congress"
+    if "shutdown" in ql or "shut down" in ql:               return "Shutdown"
+    if "shooting" in ql:                                     return "Shooting"
+    if "war"      in ql:                                     return "War"
+    if "cocaine"  in ql:                                     return "Cocaine"
+    if "fentanyl" in ql:                                     return "Fentanyl"
+    if "terrorist" in ql or "terrorism" in ql:              return "Terrorist/Terrorism"
+    if "super bowl" in ql or "big game" in ql:              return "Super Bowl/Big Game"
+    if "olympic"  in ql:                                     return "Olympic/Olympics"
     return None
+
+def match_market_souravjoshi(q):
+    return None   # no Polymarket sub-markets for testing
 
 MARKET_MATCHERS = {
-    "mrbeast": match_market_mrbeast,
-    "joerogan": match_market_joerogan,
+    "mrbeast":      match_market_mrbeast,
+    "joerogan":     match_market_joerogan,
+    "souravjoshi":  match_market_souravjoshi,
 }
 
 
@@ -386,71 +395,36 @@ MARKET_MATCHERS = {
 # ─────────────────────────────────────────────
 
 def get_polymarket_data(slug, match_fn, word_groups):
+    if not slug:
+        return None, None
     try:
-        url = f"https://gamma-api.polymarket.com/events/slug/{slug}"
-        print(f"\n🔍 Fetching from: {url}")
-        response = requests.get(url, timeout=15)
-        response.raise_for_status()
-        event = response.json()
-        markets = event.get("markets", [])
-
+        url  = f"https://gamma-api.polymarket.com/events/slug/{slug}"
+        print(f"\n🔍 Fetching: {url}")
+        resp = requests.get(url, timeout=15)
+        resp.raise_for_status()
+        markets = resp.json().get("markets", [])
         if not markets:
-            print("⚠️  No markets found!")
             return None, None
 
-        print(f"✅ Found {len(markets)} markets\n")
-        prices = {}
-        token_ids = {}
-        matched_categories = set()
-
+        prices, token_ids, matched_cats = {}, {}, set()
         for market in markets:
             question = market.get("question", "")
-            question_lower = question.lower()
-            matched_cat = match_fn(question_lower)
-
-            if not matched_cat:
-                print(f"❌ No match: {question}")
+            cat = match_fn(question)
+            if not cat or cat in matched_cats:
                 continue
-            if matched_cat in matched_categories:
-                print(f"⚠️  DUPLICATE MATCH for {matched_cat}: {question[:60]}...")
-                continue
-
-            matched_categories.add(matched_cat)
-            print(f"✅ {matched_cat:<25} ← {question[:50]}...")
-
-            outcome_prices = market.get("outcome_prices") or market.get("outcomePrices", [])
-            if isinstance(outcome_prices, str):
-                try:
-                    outcome_prices = json.loads(outcome_prices)
-                except:
-                    outcome_prices = []
-
-            yes_price = None
-            if isinstance(outcome_prices, list) and len(outcome_prices) > 0:
-                yes_price = float(outcome_prices[0])
-                print(f"   Yes Price: {yes_price:.4f} ({yes_price*100:.1f}¢)")
-            else:
-                print(f"   ⚠️  NO PRICE DATA")
-
-            yes_token = get_token_id_for_outcome(market, "yes")
-            no_token = get_token_id_for_outcome(market, "no")
-
-            if yes_price is not None:
-                prices[matched_cat] = yes_price
-            token_ids[matched_cat] = {"yes": yes_token, "no": no_token}
-            print()
-
-        print(f"📊 Summary: {len(prices)} with prices, {len(token_ids)} categories with tokens\n")
-        missing = set(word_groups.keys()) - set(prices.keys())
-        if missing:
-            print(f"⚠️  Missing from Polymarket: {', '.join(sorted(missing))}")
-
+            matched_cats.add(cat)
+            op = market.get("outcome_prices") or market.get("outcomePrices", [])
+            if isinstance(op, str):
+                try: op = json.loads(op)
+                except: op = []
+            if isinstance(op, list) and op:
+                prices[cat] = float(op[0])
+            yes_tok = get_token_id_for_outcome(market, "yes")
+            no_tok  = get_token_id_for_outcome(market, "no")
+            token_ids[cat] = {"yes": yes_tok, "no": no_tok}
         return prices, token_ids
-
     except Exception as e:
-        print(f"❌ Polymarket fetch error: {e}")
-        import traceback
-        traceback.print_exc()
+        print(f"❌ Polymarket error: {e}")
         return None, None
 
 
@@ -458,267 +432,447 @@ def get_polymarket_data(slug, match_fn, word_groups):
 # FORMAT RESULTS
 # ─────────────────────────────────────────────
 
-def format_results(text_lower, market_key):
-    config = MARKET_CONFIGS[market_key]
+def format_results(text: str, market_key: str) -> str:
+    config      = MARKET_CONFIGS[market_key]
     word_groups = config["word_groups"]
-    thresholds_map = config.get("thresholds", {})
-    default_thresh = config.get("default_threshold", 1)
-    slug = config["slug"]
-    match_fn = MARKET_MATCHERS[config["match_market"]]
+    thresh_map  = config.get("thresholds", {})
+    default_th  = config.get("default_threshold", 1)
+    slug        = config["slug"]
+    match_fn    = MARKET_MATCHERS[config["match_market"]]
+    is_testing  = config.get("testing", False)
 
-    thresholds = {cat: thresholds_map.get(cat, default_thresh) for cat in word_groups}
+    thresholds = {cat: thresh_map.get(cat, default_th) for cat in word_groups}
+    text_lower = text.lower()
+    counts     = {cat: count_matches(text_lower, spec) for cat, spec in word_groups.items()}
+    sorted_cnt = dict(sorted(counts.items()))
+    total      = sum(sorted_cnt.values())
 
-    # Count using the rule-aware engine
-    counts = {cat: count_matches(text_lower, spec) for cat, spec in word_groups.items()}
-    sorted_counts = dict(sorted(counts.items()))
-    total = sum(sorted_counts.values())
-
+    # ── Word count table ────────────────────
     msg = f"<b>📊 Word Counts — {config['label']}</b>\n<pre>"
-    for category, count in sorted_counts.items():
-        thresh = thresholds.get(category, 1)
+    for cat, count in sorted_cnt.items():
+        thresh = thresholds.get(cat, 1)
         if count >= thresh:
-            msg += f"{category:<24} {count:>4} ✅\n"
+            msg += f"{cat:<28} {count:>4} ✅\n"
         elif count > 0:
-            msg += f"{category:<24} {count:>4} ❌\n"
-    msg += f"{'─'*30}\nTOTAL: {total}\n</pre>"
+            msg += f"{cat:<28} {count:>4} ❌\n"
+    msg += f"{'─'*34}\nTOTAL: {total}\n</pre>"
 
+    if is_testing:
+        return f"<b>🧪 TEST MODE — {config['label']}</b>\n\n{msg}\n<i>No Polymarket trades (testing only).</i>"
+
+    # ── Polymarket prices ────────────────────
     prices, token_ids = get_polymarket_data(slug, match_fn, word_groups)
-
-    opportunities = []
-    missing_data = []
+    opportunities, missing_data = [], []
 
     if prices:
-        for cat, count in sorted_counts.items():
-            thresh = thresholds.get(cat, 1)
-            yes_p = prices.get(cat)
+        for cat, count in sorted_cnt.items():
+            thresh  = thresholds.get(cat, 1)
+            yes_p   = prices.get(cat)
             if yes_p is None:
                 continue
-            no_p = 1.0 - yes_p
-            tokens = token_ids.get(cat, {})
-            yes_token = tokens.get("yes")
-            no_token = tokens.get("no")
-
+            no_p    = 1.0 - yes_p
+            tokens  = token_ids.get(cat, {})
+            yes_tok = tokens.get("yes")
+            no_tok  = tokens.get("no")
             if count >= thresh:
-                if yes_p < 0.95 and yes_token:
+                if yes_p < 0.95 and yes_tok:
                     edge = int((1.0 - yes_p) / yes_p * 100) if yes_p > 0 else 999
-                    opportunities.append((cat, "Yes", yes_token, yes_p, edge))
-                elif yes_p < 0.95 and not yes_token:
+                    opportunities.append((cat, "Yes", yes_tok, yes_p, edge))
+                elif yes_p < 0.95:
                     missing_data.append(f"{cat} (Yes)")
             else:
-                if count == 0 or count < thresh:
-                    if no_p < 0.95 and no_token:
-                        edge = int((1.0 - no_p) / no_p * 100) if no_p > 0 else 999
-                        opportunities.append((cat, "No", no_token, no_p, edge))
-                    elif no_p < 0.95 and not no_token:
-                        missing_data.append(f"{cat} (No)")
+                if no_p < 0.95 and no_tok:
+                    edge = int((1.0 - no_p) / no_p * 100) if no_p > 0 else 999
+                    opportunities.append((cat, "No", no_tok, no_p, edge))
+                elif no_p < 0.95:
+                    missing_data.append(f"{cat} (No)")
 
         poly_section = f"\n<b>🎯 Opportunities: {len(opportunities)}</b>"
         if opportunities:
             poly_section += "\n<pre>"
             for cat, side, _, price, edge in opportunities:
-                poly_section += f"{cat:<24} {side} {price:.2f} ~{edge}%\n"
+                poly_section += f"{cat:<28} {side:<4} {price:.2f}  ~{edge}%\n"
             poly_section += "</pre>"
         if missing_data:
-            poly_section += f"\n<i>⚠️ Missing token for: {', '.join(missing_data[:5])}</i>"
+            poly_section += f"\n<i>⚠️ No token: {', '.join(missing_data[:5])}</i>"
     else:
-        poly_section = "\n<i>⚠️ Failed to fetch market data.</i>"
+        poly_section = "\n<i>⚠️ Failed to fetch Polymarket data.</i>"
         opportunities = []
 
+    # ── Auto-trade ───────────────────────────
     trade_results = []
     if AUTO_TRADE and PRIVATE_KEY and opportunities:
-        actual_trade_amt = max(TRADE_AMOUNT, MIN_TRADE_AMOUNT)
+        actual_amt = max(TRADE_AMOUNT, MIN_TRADE_AMOUNT)
         try:
-            pk = PRIVATE_KEY[2:] if PRIVATE_KEY.startswith('0x') else PRIVATE_KEY
+            pk     = PRIVATE_KEY[2:] if PRIVATE_KEY.startswith("0x") else PRIVATE_KEY
             client = ClobClient(
                 host="https://clob.polymarket.com",
                 chain_id=137,
                 key=pk,
                 signature_type=1,
-                funder=WALLET_ADDRESS or None
+                funder=WALLET_ADDRESS or None,
             )
-            creds = client.create_or_derive_api_creds()
-            client.set_api_creds(creds)
-            address = client.get_address()
-            print(f"\n🔑 Trading wallet: {address}")
-
-            try:
-                balance_resp = client.get_balance()
-                usdc_balance = float(balance_resp.get("balance", 0)) / 1e6
-                print(f"💰 USDC Balance: ${usdc_balance:.2f}")
-                if usdc_balance < actual_trade_amt * len(opportunities):
-                    trade_results.append(f"⚠️ Low balance: ${usdc_balance:.2f}")
-            except Exception as e:
-                print(f"⚠️  Balance check failed: {e}")
-
-            for cat, side, token_id, price, edge in opportunities:
+            client.set_api_creds(client.create_or_derive_api_creds())
+            for cat, side, tok, price, edge in opportunities:
                 try:
-                    print(f"\n📊 Trading {cat} {side}: Token={token_id} Price={price:.4f} Amount=${actual_trade_amt}")
-                    args = MarketOrderArgs(token_id=token_id, amount=actual_trade_amt, side=BUY)
+                    args   = MarketOrderArgs(token_id=tok, amount=actual_amt, side=BUY)
                     signed = client.create_market_order(args)
-                    resp = client.post_order(signed, OrderType.FOK)
-                    print(f"   Response: {resp}")
-                    order_id = resp.get("order_id") or resp.get("orderID")
-                    success = resp.get("success", False)
+                    resp   = client.post_order(signed, OrderType.FOK)
                     status = resp.get("status", "")
-                    if order_id or success or status in ["matched", "live", "open"]:
-                        trade_results.append(f"✅ {cat[:14]} {side} ${actual_trade_amt}")
-                        time.sleep(0.5)
+                    if resp.get("order_id") or resp.get("success") or status in ("matched","live","open"):
+                        trade_results.append(f"✅ {cat[:16]} {side} ${actual_amt}")
                     else:
-                        trade_results.append(f"⚠️ {cat[:14]} {side} No fill")
-                except Exception as e:
-                    trade_results.append(f"❌ {cat[:14]} {side} Error")
+                        trade_results.append(f"⚠️ {cat[:16]} {side} No fill")
+                    time.sleep(0.5)
+                except Exception:
+                    trade_results.append(f"❌ {cat[:16]} {side} Error")
                     time.sleep(0.5)
         except Exception as e:
-            print(f"\n❌ Trading setup failed: {e}")
-            trade_results.append("❌ Setup failed")
+            trade_results.append(f"❌ Setup failed: {str(e)[:60]}")
 
     result = f"<b>Polymarket Sniper 🚀</b>\n\n{msg}{poly_section}"
     if trade_results:
         result += f"\n\n<b>🤖 Trades (${max(TRADE_AMOUNT, MIN_TRADE_AMOUNT)})</b>\n"
         result += "\n".join(trade_results[:10])
-    elif AUTO_TRADE and opportunities:
-        result += "\n\n<i>AUTO_TRADE enabled but no trades executed</i>"
-
     return result
 
 
 # ─────────────────────────────────────────────
-# BOT HANDLERS
+# AUTO-MONITOR THREAD
+# Polls YouTube every POLL_INTERVAL seconds.
+# When a NEW video appears it transcribes and
+# calls format_results, then sends to the user.
 # ─────────────────────────────────────────────
 
-@bot.message_handler(commands=['start', 'help'])
+def monitor_channel(chat_id: int, market_key: str, stop_event: threading.Event):
+    config      = MARKET_CONFIGS[market_key]
+    chan_key    = config["channel_key"]
+    channel_id  = CHANNELS[chan_key]["channel_id"]
+    chan_label  = config["label"]
+
+    last_vid_id = None
+    # Seed with the current latest video so we don't re-process it
+    seed = get_latest_video(channel_id)
+    if seed:
+        last_vid_id = seed["video_id"]
+        print(f"[Monitor] Seeded with video {last_vid_id} for chat {chat_id}")
+
+    bot.send_message(
+        chat_id,
+        f"👁 <b>Monitoring started</b> for {chan_label}\n"
+        f"Checking every <b>{POLL_INTERVAL}s</b> for new videos.\n"
+        f"Use /stop to cancel.",
+        parse_mode="HTML",
+    )
+
+    while not stop_event.is_set():
+        stop_event.wait(POLL_INTERVAL)
+        if stop_event.is_set():
+            break
+        try:
+            latest = get_latest_video(channel_id)
+            if not latest:
+                continue
+            vid_id = latest["video_id"]
+            if vid_id == last_vid_id:
+                continue   # Nothing new
+            # New video detected!
+            last_vid_id = vid_id
+            title = latest["title"]
+            print(f"[Monitor] New video: {vid_id} — {title}")
+            bot.send_message(
+                chat_id,
+                f"🆕 <b>New video detected!</b>\n"
+                f"🎬 <a href='https://youtu.be/{vid_id}'>{title}</a>\n"
+                f"⏳ Fetching transcript…",
+                parse_mode="HTML",
+                disable_web_page_preview=True,
+            )
+            transcript = fetch_transcript(vid_id)
+            if not transcript:
+                bot.send_message(
+                    chat_id,
+                    "⚠️ Transcript not available yet. Will retry on next check.",
+                    parse_mode="HTML",
+                )
+                last_vid_id = None   # reset so we retry same video next tick
+                continue
+            result = format_results(transcript, market_key)
+            bot.send_message(chat_id, result, parse_mode="HTML")
+        except Exception as e:
+            print(f"[Monitor] Error: {e}")
+
+    bot.send_message(chat_id, "⛔ Monitoring stopped.", parse_mode="HTML")
+
+
+def start_monitoring(chat_id: int, market_key: str):
+    stop_monitoring(chat_id)   # kill any existing thread first
+    stop_event = threading.Event()
+    t = threading.Thread(
+        target=monitor_channel,
+        args=(chat_id, market_key, stop_event),
+        daemon=True,
+    )
+    user_state[chat_id]["stop_event"]     = stop_event
+    user_state[chat_id]["monitor_thread"] = t
+    user_state[chat_id]["mode"]           = "monitoring"
+    t.start()
+
+
+def stop_monitoring(chat_id: int):
+    state = user_state.get(chat_id, {})
+    ev = state.get("stop_event")
+    if ev:
+        ev.set()
+    user_state.get(chat_id, {}).pop("stop_event",     None)
+    user_state.get(chat_id, {}).pop("monitor_thread", None)
+
+
+# ─────────────────────────────────────────────
+# INLINE KEYBOARD HELPERS
+# ─────────────────────────────────────────────
+
+def market_keyboard():
+    kb = types.InlineKeyboardMarkup(row_width=1)
+    kb.add(
+        types.InlineKeyboardButton("🎬 MrBeast YouTube",         callback_data="market_mrbeast"),
+        types.InlineKeyboardButton("🎙️ Joe Rogan Experience",    callback_data="market_joerogan"),
+        types.InlineKeyboardButton("🇮🇳 Sourav Joshi (Testing)", callback_data="market_souravjoshi"),
+    )
+    return kb
+
+def yesno_keyboard(yes_data: str, no_data: str):
+    kb = types.InlineKeyboardMarkup(row_width=2)
+    kb.add(
+        types.InlineKeyboardButton("✅ Yes", callback_data=yes_data),
+        types.InlineKeyboardButton("❌ No",  callback_data=no_data),
+    )
+    return kb
+
+
+# ─────────────────────────────────────────────
+# BOT COMMAND HANDLERS
+# ─────────────────────────────────────────────
+
+@bot.message_handler(commands=["start", "help"])
 def send_welcome(message):
     chat_id = message.chat.id
-    current = user_market_selection.get(chat_id, None)
-    current_label = MARKET_CONFIGS[current]['label'] if current else "None selected"
-    actual_trade_amt = max(TRADE_AMOUNT, MIN_TRADE_AMOUNT)
-    wallet_display = f"{WALLET_ADDRESS[:10]}...{WALLET_ADDRESS[-6:]}" if WALLET_ADDRESS else "Not set"
-
-    welcome_text = (
+    actual_amt = max(TRADE_AMOUNT, MIN_TRADE_AMOUNT)
+    wallet_disp = (f"{WALLET_ADDRESS[:10]}…{WALLET_ADDRESS[-6:]}"
+                   if WALLET_ADDRESS else "Not set")
+    bot.send_message(
+        chat_id,
         "<b>🎯 Polymarket Word Sniper Bot</b>\n\n"
-        "Send a YouTube URL/ID, transcript text, or .txt file to analyze.\n\n"
-        "<b>📌 Select your market first:</b>\n"
-        "• /market1 — 🎬 MrBeast YouTube\n"
-        "• /market2 — 🎙️ Joe Rogan Experience\n\n"
-        f"<b>Current market:</b> {current_label}\n\n"
-        f"<b>Settings:</b>\n"
-        f"• Trade amount: ${actual_trade_amt} per opportunity\n"
-        f"• Min trade: ${MIN_TRADE_AMOUNT}\n"
-        f"• Wallet: {wallet_display}\n"
-        f"• AutoTrade: {'✅ ENABLED' if AUTO_TRADE else '❌ DISABLED'}"
-    )
-    bot.reply_to(message, welcome_text, parse_mode='HTML')
-
-
-@bot.message_handler(commands=['market1'])
-def select_market1(message):
-    user_market_selection[message.chat.id] = "mrbeast"
-    config = MARKET_CONFIGS["mrbeast"]
-    bot.reply_to(
-        message,
-        f"✅ Market set to: <b>{config['label']}</b>\n"
-        f"<code>{config['slug']}</code>\n\n"
-        f"Now send a YouTube URL, transcript text, or .txt file.",
-        parse_mode='HTML'
+        "Step 1 — pick your market below.\n"
+        "Step 2 — choose auto-monitor or paste a video link.\n\n"
+        f"Settings: trade ${actual_amt} | AutoTrade {'✅' if AUTO_TRADE else '❌'} | "
+        f"Wallet {wallet_disp}",
+        parse_mode="HTML",
+        reply_markup=market_keyboard(),
     )
 
 
-@bot.message_handler(commands=['market2'])
-def select_market2(message):
-    user_market_selection[message.chat.id] = "joerogan"
-    config = MARKET_CONFIGS["joerogan"]
-    bot.reply_to(
-        message,
-        f"✅ Market set to: <b>{config['label']}</b>\n"
-        f"<code>{config['slug']}</code>\n\n"
-        f"Now send a YouTube URL, transcript text, or .txt file.",
-        parse_mode='HTML'
+@bot.message_handler(commands=["market"])
+def cmd_market(message):
+    bot.send_message(
+        message.chat.id,
+        "Select a market:",
+        parse_mode="HTML",
+        reply_markup=market_keyboard(),
     )
 
 
-@bot.message_handler(commands=['market'])
-def show_market_menu(message):
+@bot.message_handler(commands=["stop"])
+def cmd_stop(message):
     chat_id = message.chat.id
-    current = user_market_selection.get(chat_id, None)
-    current_label = MARKET_CONFIGS[current]['label'] if current else "None selected"
-    bot.reply_to(
-        message,
-        f"<b>🔀 Market Selection</b>\n\n"
-        f"Current: <b>{current_label}</b>\n\n"
-        f"Switch to:\n"
-        f"• /market1 → 🎬 MrBeast YouTube\n"
-        f"• /market2 → 🎙️ Joe Rogan Experience",
-        parse_mode='HTML'
-    )
+    state   = user_state.get(chat_id, {})
+    if state.get("mode") == "monitoring":
+        stop_monitoring(chat_id)
+        state["mode"] = "awaiting_link"
+        bot.reply_to(message, "⛔ Monitoring stopped.")
+    else:
+        bot.reply_to(message, "ℹ️ No active monitor to stop.")
 
 
-def prompt_market_selection(message):
-    bot.reply_to(
-        message,
-        "👋 Please select which market to trade on first:\n\n"
-        "• /market1 → 🎬 MrBeast YouTube\n"
-        "• /market2 → 🎙️ Joe Rogan Experience\n\n"
-        "After selecting, resend your input.",
-        parse_mode='HTML'
-    )
-
-
-@bot.message_handler(content_types=['text'])
-def handle_text(message):
+@bot.message_handler(commands=["status"])
+def cmd_status(message):
     chat_id = message.chat.id
+    state   = user_state.get(chat_id, {})
+    mk      = state.get("market_key")
+    mode    = state.get("mode", "—")
+    label   = MARKET_CONFIGS[mk]["label"] if mk else "None"
+    bot.reply_to(
+        message,
+        f"<b>Status</b>\nMarket: {label}\nMode: {mode}",
+        parse_mode="HTML",
+    )
+
+
+# ─────────────────────────────────────────────
+# CALLBACK QUERY HANDLER (inline buttons)
+# ─────────────────────────────────────────────
+
+@bot.callback_query_handler(func=lambda call: True)
+def handle_callback(call: types.CallbackQuery):
+    chat_id = call.message.chat.id
+    data    = call.data
+
+    # ── Market selection ─────────────────────
+    if data.startswith("market_"):
+        mk = data[len("market_"):]
+        if mk not in MARKET_CONFIGS:
+            bot.answer_callback_query(call.id, "Unknown market.")
+            return
+        config = MARKET_CONFIGS[mk]
+        user_state[chat_id] = {"market_key": mk, "mode": "ask_monitor"}
+        bot.edit_message_text(
+            f"✅ Market set: <b>{config['label']}</b>",
+            chat_id, call.message.message_id,
+            parse_mode="HTML",
+        )
+
+        # Sourav Joshi — ask about testing first
+        if config.get("testing"):
+            bot.send_message(
+                chat_id,
+                "🧪 <b>Sourav Joshi</b> is in <b>testing mode</b> (no real Polymarket trades).\n"
+                "The bot will track occurrences of <b>अवंतिका</b> in new videos.\n\n"
+                "Do you want to run the bot for the <b>next uploaded video</b>?",
+                parse_mode="HTML",
+                reply_markup=yesno_keyboard("monitor_yes", "monitor_no"),
+            )
+        else:
+            bot.send_message(
+                chat_id,
+                f"Do you want to run the bot for the <b>next video uploaded</b> on "
+                f"<b>{config['label']}</b>?",
+                parse_mode="HTML",
+                reply_markup=yesno_keyboard("monitor_yes", "monitor_no"),
+            )
+        bot.answer_callback_query(call.id)
+        return
+
+    # ── Monitor yes/no ───────────────────────
+    if data == "monitor_yes":
+        state = user_state.get(chat_id)
+        if not state:
+            bot.answer_callback_query(call.id, "Please select a market first.")
+            return
+        mk = state.get("market_key")
+        bot.edit_message_reply_markup(chat_id, call.message.message_id, reply_markup=None)
+        if not YOUTUBE_API_KEY:
+            bot.send_message(
+                chat_id,
+                "⚠️ <b>YOUTUBE_API_KEY</b> is not set in environment.\n"
+                "Cannot poll YouTube. Please set it and restart the bot.",
+                parse_mode="HTML",
+            )
+            bot.answer_callback_query(call.id)
+            return
+        start_monitoring(chat_id, mk)
+        bot.answer_callback_query(call.id, "Monitoring started!")
+        return
+
+    if data == "monitor_no":
+        state = user_state.get(chat_id)
+        if state:
+            state["mode"] = "awaiting_link"
+        bot.edit_message_reply_markup(chat_id, call.message.message_id, reply_markup=None)
+        bot.send_message(
+            chat_id,
+            "📎 Please send a <b>YouTube URL/ID</b> or paste <b>transcript text</b> directly.",
+            parse_mode="HTML",
+        )
+        bot.answer_callback_query(call.id)
+        return
+
+    bot.answer_callback_query(call.id)
+
+
+# ─────────────────────────────────────────────
+# TEXT HANDLER
+# ─────────────────────────────────────────────
+
+@bot.message_handler(content_types=["text"])
+def handle_text(message: types.Message):
+    chat_id   = message.chat.id
     user_text = message.text.strip()
     if not user_text:
         return
 
-    if chat_id not in user_market_selection:
-        prompt_market_selection(message)
+    state = user_state.get(chat_id)
+    if not state or "market_key" not in state:
+        bot.reply_to(
+            message,
+            "👋 Please select a market first:",
+            reply_markup=market_keyboard(),
+        )
         return
 
-    market_key = user_market_selection[chat_id]
-    video_id = extract_video_id(user_text)
+    mode = state.get("mode")
+    if mode == "monitoring":
+        bot.reply_to(
+            message,
+            "ℹ️ Auto-monitor is active. Use /stop to cancel it first.",
+        )
+        return
+
+    if mode == "ask_monitor":
+        bot.reply_to(
+            message,
+            "Please answer the auto-monitor question above, or use /market to restart.",
+        )
+        return
+
+    # ── Normal flow: "awaiting_link" or anything else ──
+    market_key = state["market_key"]
+    video_id   = extract_video_id(user_text)
 
     if video_id and API_TOKEN:
-        bot.reply_to(message, "🔄 Fetching transcript...")
-        try:
-            url = "https://www.youtube-transcript.io/api/transcripts"
-            headers = {"Authorization": f"Basic {API_TOKEN}", "Content-Type": "application/json"}
-            payload = {"ids": [video_id]}
-            response = requests.post(url, headers=headers, json=payload, timeout=30)
-            response.raise_for_status()
-            raw_text = extract_transcript_text(response.json())
-            if not raw_text.strip():
-                bot.reply_to(message, "No transcript found. Please paste the text manually.")
-                return
-        except Exception as e:
-            bot.reply_to(message, f"❌ Fetch error: {str(e)[:200]}")
+        bot.reply_to(message, "🔄 Fetching transcript…")
+        transcript = fetch_transcript(video_id)
+        if not transcript:
+            bot.reply_to(message, "⚠️ Transcript not available. Try pasting text manually.")
             return
+    elif video_id and not API_TOKEN:
+        bot.reply_to(message, "⚠️ API_TOKEN not set — paste transcript text directly.")
+        return
     else:
-        raw_text = user_text
+        transcript = user_text
 
-    result_msg = format_results(raw_text.lower(), market_key)
-    bot.send_message(chat_id, result_msg, parse_mode='HTML')
+    result = format_results(transcript, market_key)
+    bot.send_message(chat_id, result, parse_mode="HTML")
 
 
-@bot.message_handler(content_types=['document'])
-def handle_document(message):
+# ─────────────────────────────────────────────
+# DOCUMENT HANDLER (.txt files)
+# ─────────────────────────────────────────────
+
+@bot.message_handler(content_types=["document"])
+def handle_document(message: types.Message):
     chat_id = message.chat.id
-    doc = message.document
+    doc     = message.document
 
-    if not (doc.mime_type == 'text/plain' or doc.file_name.lower().endswith('.txt')):
+    if not (doc.mime_type == "text/plain" or doc.file_name.lower().endswith(".txt")):
         bot.reply_to(message, "Please send a .txt file only.")
         return
 
-    if chat_id not in user_market_selection:
-        prompt_market_selection(message)
+    state = user_state.get(chat_id)
+    if not state or "market_key" not in state:
+        bot.reply_to(
+            message,
+            "👋 Please select a market first:",
+            reply_markup=market_keyboard(),
+        )
         return
 
-    bot.reply_to(message, "📄 Processing...")
+    bot.reply_to(message, "📄 Processing…")
     try:
-        file_info = bot.get_file(doc.file_id)
+        file_info  = bot.get_file(doc.file_id)
         downloaded = bot.download_file(file_info.file_path)
-        transcript = downloaded.decode('utf-8', errors='replace')
-        result_msg = format_results(transcript.lower(), user_market_selection[chat_id])
-        bot.send_message(chat_id, result_msg, parse_mode='HTML')
+        transcript = downloaded.decode("utf-8", errors="replace")
+        result     = format_results(transcript, state["market_key"])
+        bot.send_message(chat_id, result, parse_mode="HTML")
     except Exception as e:
         bot.reply_to(message, f"❌ Error: {str(e)}")
 
@@ -727,12 +881,13 @@ def handle_document(message):
 # STARTUP
 # ─────────────────────────────────────────────
 
-print(f"Bot starting...")
-print(f"  Market 1 (MrBeast):   {POLYMARKET_SLUG_1}")
-print(f"  Market 2 (Joe Rogan): {POLYMARKET_SLUG_2}")
-print(f"  AUTO_TRADE: {AUTO_TRADE}")
-print(f"  TRADE_AMOUNT: ${TRADE_AMOUNT}")
-print(f"  MIN_TRADE_AMOUNT: ${MIN_TRADE_AMOUNT}")
-print(f"  Actual trade amount: ${max(TRADE_AMOUNT, MIN_TRADE_AMOUNT)}")
-print(f"  Wallet: {WALLET_ADDRESS[:10] if WALLET_ADDRESS else 'Not set'}...")
+print("Bot starting…")
+print(f"  Markets: {', '.join(MARKET_CONFIGS.keys())}")
+print(f"  AUTO_TRADE:    {AUTO_TRADE}")
+print(f"  TRADE_AMOUNT:  ${max(TRADE_AMOUNT, MIN_TRADE_AMOUNT)}")
+print(f"  POLL_INTERVAL: {POLL_INTERVAL}s")
+print(f"  YouTube API:   {'✅' if YOUTUBE_API_KEY else '❌ NOT SET'}")
+print(f"  Transcript API:{'✅' if API_TOKEN else '❌ NOT SET'}")
+print(f"  Wallet:        {WALLET_ADDRESS[:10] + '…' if WALLET_ADDRESS else 'Not set'}")
+
 bot.infinity_polling()

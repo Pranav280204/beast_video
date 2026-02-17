@@ -114,12 +114,12 @@ CHANNELS = {
         "label":       "🎬 MrBeast YouTube",
     },
     "joerogan": {
-        "channel_id":  "UCzWQYUVCpZqtN93H8RR44Qw",
+        "channel_id":  "UCzQUP1qoWDoEbmsQxvdjxgQ",
         "handle":      "@joerogan",
         "label":       "🎙️ Joe Rogan Experience",
     },
     "souravjoshi": {
-        "channel_id":  "UCH-0f3dhAQS9r1Yg3Wl1xJQ",
+        "channel_id":  "UCjvgGbPPn-FgYeguc5nxG4A",
         "handle":      "@SouravJoshiVlogs",
         "label":       "🇮🇳 Sourav Joshi Vlogs (Testing)",
         "testing":     True,
@@ -252,20 +252,22 @@ def _yt_get(url: str, params: dict) -> "requests.Response | None":
         try:
             r = requests.get(url, params=request_params, timeout=15)
             if r.status_code == 403:
-                print(f"⚠️  Key quota hit (403). Rotating to next key…")
+                log(f"[YT] ⚠️  403 quota hit on key #{self._keys.index(key)+1 if key in self._keys else '?'}. Rotating…")
                 YT_KEYS.mark_exhausted(key)
                 tried += 1
                 continue
             if r.status_code == 400:
-                print(f"❌ Bad request (400): {r.text[:200]}")
+                log(f"[YT] ❌ 400 Bad Request")
+                log(f"[YT]    Requested URL: {r.url}")
+                log(f"[YT]    Response body: {r.text[:500]}")
                 return None
             r.raise_for_status()
             return r
         except requests.exceptions.HTTPError as e:
-            print(f"❌ HTTP error: {e}")
+            log(f"[YT] ❌ HTTP error: {e}")
             tried += 1
         except Exception as e:
-            print(f"❌ YouTube API error: {e}")
+            log(f"[YT] ❌ Request exception: {e}")
             return None
     return None
 
@@ -273,9 +275,10 @@ def _yt_get(url: str, params: dict) -> "requests.Response | None":
 def get_latest_video(channel_id: str) -> dict | None:
     """Return latest non-Shorts video dict or None."""
     if not YT_KEYS.available:
-        print("⚠️  No YouTube API keys set or all exhausted.")
+        log(f"[YT] ❌ No YouTube API keys available.")
         return None
     try:
+        log(f"[YT] search → channelId={channel_id}")
         r = _yt_get(
             "https://www.googleapis.com/youtube/v3/search",
             {
@@ -287,16 +290,33 @@ def get_latest_video(channel_id: str) -> dict | None:
             },
         )
         if r is None:
+            log(f"[YT] search returned None (key error / bad request / all keys exhausted)")
             return None
-        for item in r.json().get("items", []):
+
+        data  = r.json()
+        items = data.get("items", [])
+        log(f"[YT] search OK — {len(items)} items returned")
+
+        if not items:
+            log(f"[YT] ⚠️  0 items — raw response: {str(data)[:300]}")
+            return None
+
+        for item in items:
             vid_id = item["id"]["videoId"]
             title  = item["snippet"]["title"]
-            # Exclude Shorts by checking duration via videos endpoint
-            if not is_short(vid_id):
+            log(f"[YT] Checking: {vid_id} | {title}")
+            short  = is_short(vid_id)
+            log(f"[YT]   → is_short={short}")
+            if not short:
+                log(f"[YT] ✅ Using: {vid_id} | {title}")
                 return {"video_id": vid_id, "title": title}
+
+        log(f"[YT] All {len(items)} results were Shorts — returning None")
         return None
+
     except Exception as e:
-        print(f"❌ YouTube search error: {e}")
+        import traceback
+        log(f"[YT] ❌ Exception in get_latest_video: {e}\n{traceback.format_exc()}")
         return None
 
 
@@ -310,14 +330,18 @@ def is_short(video_id: str) -> bool:
             {"id": video_id, "part": "contentDetails"},
         )
         if r is None:
+            log(f"[YT] is_short({video_id}): _yt_get returned None → assuming NOT short")
             return False
         items = r.json().get("items", [])
         if not items:
+            log(f"[YT] is_short({video_id}): no items in response → assuming NOT short")
             return False
         duration  = items[0]["contentDetails"]["duration"]
         total_sec = parse_iso8601_duration(duration)
+        log(f"[YT] is_short({video_id}): duration={duration} ({total_sec}s)")
         return total_sec <= 60
-    except:
+    except Exception as e:
+        log(f"[YT] is_short({video_id}): exception {e} → assuming NOT short")
         return False
 
 

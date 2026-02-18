@@ -450,8 +450,10 @@ MARKET_CONFIGS = {
             "MrBeast":                  ("simple", r"\bmr\.?\s*beast'?s?\b"),
             "Insane":                   ("simple", r"\binsane\b"),
             "Subscribe":                ("simple", r"\bsubscri(?:be'?s?|bed|bing|ber'?s?|ption'?s?)\b"),
+            "Cocoa":                    ("simple", r"\bcocoa'?s?\b"),
+            "Chocolate":                ("simple", r"\bchocolate'?s?\b"),
         },
-        "thresholds": {"Dollar": 10, "Thousand/Million": 10},
+        "thresholds": {"Dollar": 10, "Thousand/Million": 10, "Cocoa": 3, "Chocolate": 3},
         "default_threshold": 1,
         "match_market": "mrbeast",
     },
@@ -530,6 +532,8 @@ def match_market_mrbeast(q):
     if "subscribe"  in ql: return "Subscribe"
     if "insane"     in ql: return "Insane"
     if "feastables" in ql: return "Feastables"
+    if "cocoa"      in ql: return "Cocoa"
+    if "chocolate"  in ql: return "Chocolate"
     if "mrbeast" in ql or "mr beast" in ql:                return "MrBeast"
     if "eliminated" in ql: return "Eliminated"
     if "challenge"  in ql: return "Challenge"
@@ -629,7 +633,7 @@ def format_results(text: str, market_key: str) -> str:
     sorted_cnt = dict(sorted(counts.items()))
     total      = sum(sorted_cnt.values())
 
-    # ── Word count table ────────────────────
+    # ── Word count table — always shows every outcome ───────────────────
     msg = f"<b>📊 Word Counts — {config['label']}</b>\n<pre>"
     for cat, count in sorted_cnt.items():
         thresh = thresholds.get(cat, 1)
@@ -637,6 +641,8 @@ def format_results(text: str, market_key: str) -> str:
             msg += f"{cat:<28} {count:>4} ✅\n"
         elif count > 0:
             msg += f"{cat:<28} {count:>4} ❌\n"
+        else:
+            msg += f"{cat:<28} {count:>4} ➖\n"   # zero — always shown
     msg += f"{'─'*34}\nTOTAL: {total}\n</pre>"
 
     if is_testing:

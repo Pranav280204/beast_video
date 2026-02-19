@@ -540,27 +540,49 @@ MARKET_CONFIGS = {
 # MARKET MATCHING FUNCTIONS
 # ─────────────────────────────────────────────
 
-def match_market_mrbeast(q):
+def match_market_mrbeast(q: str) -> str | None:
+    """
+    Extract the TARGET TERM from a Polymarket question like:
+      'Will MrBeast say challenge during his next YouTube video?'
+      'Will MrBeast say dollar 10+ times during his next YouTube video?'
+
+    Strategy: strip the boilerplate and match the remaining term to a category.
+    This avoids the old bug where every question matched 'MrBeast' because
+    all questions contain the word 'mrbeast' in the boilerplate.
+    """
     ql = q.lower()
-    if "beast games"  in ql: return "Beast Games"
-    if "mystery box"  in ql: return "Mystery Box"
-    if "world's biggest" in ql or "world's largest" in ql: return "World's Biggest/Largest"
-    if "tesla" in ql and "lamborghini" in ql:              return "Tesla/Lamborghini"
-    if "helicopter" in ql and "jet" in ql:                 return "Helicopter/Jet"
-    if "car" in ql and "supercar" in ql:                   return "Car/Supercar"
-    if ("thousand" in ql or "million" in ql) and "10+" in ql: return "Thousand/Million"
-    if "dollar" in ql and "10+" in ql:                     return "Dollar"
-    if "subscribe"  in ql: return "Subscribe"
-    if "insane"     in ql: return "Insane"
-    if "feastables" in ql: return "Feastables"
-    if "cocoa"      in ql: return "Cocoa"
-    if "chocolate"  in ql: return "Chocolate"
-    if "mrbeast" in ql or "mr beast" in ql:                return "MrBeast"
-    if "eliminated" in ql: return "Eliminated"
-    if "challenge"  in ql: return "Challenge"
-    if "massive"    in ql: return "Massive"
-    if "island"     in ql: return "Island"
-    if "trap"       in ql: return "Trap"
+
+    # ── Extract the core term between "say" and "during/10+/5+/3+" ──────
+    # Pattern: "will mrbeast say <TERM> [N+ times] during..."
+    import re as _re
+    m = _re.search(r"\bsay\s+(.+?)(?:\s+\d+\+\s+times?|\s+during\b)", ql)
+    term = m.group(1).strip() if m else ql   # fallback to full question
+
+    # ── Match extracted term to category ────────────────────────────────
+    if "beast games"                      in term: return "Beast Games"
+    if "mystery box"                      in term: return "Mystery Box"
+    if "world" in term and ("biggest" in term or "largest" in term):
+                                                   return "World's Biggest/Largest"
+    if "tesla"        in term:                     return "Tesla/Lamborghini"
+    if "lamborghini"  in term:                     return "Tesla/Lamborghini"
+    if "helicopter"   in term:                     return "Helicopter/Jet"
+    if "jet"          in term:                     return "Helicopter/Jet"
+    if "thousand"     in term or "million" in term or "billion" in term:
+                                                   return "Thousand/Million"
+    if "dollar"       in term:                     return "Dollar"
+    if "subscribe"    in term:                     return "Subscribe"
+    if "insane"       in term:                     return "Insane"
+    if "feastables"   in term:                     return "Feastables"
+    if "cocoa"        in term:                     return "Cocoa"
+    if "chocolate"    in term:                     return "Chocolate"
+    if "mr" in term and "beast" in term:           return "MrBeast"
+    if "mrbeast"      in term:                     return "MrBeast"
+    if "eliminated"   in term:                     return "Eliminated"
+    if "challenge"    in term:                     return "Challenge"
+    if "massive"      in term:                     return "Massive"
+    if "island"       in term:                     return "Island"
+    if "trap"         in term:                     return "Trap"
+    if "car"          in term:                     return "Car/Supercar"
     return None
 
 def match_market_joerogan(q):

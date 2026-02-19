@@ -273,37 +273,76 @@ def _yt_get(url: str, params: dict) -> "requests.Response | None":
 
 
 
+
+
 def _uploads_playlist_id(channel_id: str) -> str:
-    """
-    Convert a channel ID to its Uploads playlist ID.
-    UC... → UU...  (just swap the 2nd char from C to U)
-    No API call needed — this is a guaranteed YouTube convention.
-    """
+    """UC... → UU...  (guaranteed YouTube convention, zero API cost)"""
     return "UU" + channel_id[2:]
+
+
+# ─────────────────────────────────────────────────────────────────────
+# TWO-STAGE DETECTION  (same technique as the Google Apps Script above)
+#
+#  Stage 1 — TRIPWIRE (1 quota unit/poll)
+#    channels?part=statistics → videoCount
+#    Increments INSTANTLY when YouTube publishes a video.
+#    No cache lag. This is what the GAS script used.
+#
+#  Stage 2 — FETCH (2 quota units, only when count increases)
+#    playlistItems.list + videos.list(batch) → latest non-Short
+#
+#  Total quota per poll:  1 unit  (vs 2 before, and 100+ with search.list)
+#  With 5 keys @ 4s interval: 50,000/day ÷ 1 = 50,000 polls possible
+# ─────────────────────────────────────────────────────────────────────
+
+def get_video_count(channel_id: str) -> int | None:
+    """
+    Stage 1 tripwire: returns total video count for a channel.
+    Costs 1 quota unit. Updates instantly on new upload — no cache lag.
+    Returns None on API failure.
+    """
+    if not YT_KEYS.available:
+        log("[YT] ❌ No YouTube API keys available.")
+        return None
+    try:
+        log(f"[YT] channels.statistics → {channel_id}")
+        r = _yt_get(
+            "https://www.googleapis.com/youtube/v3/channels",
+            {"id": channel_id, "part": "statistics"},
+        )
+        if r is None:
+            log("[YT] channels.statistics returned None")
+            return None
+        items = r.json().get("items", [])
+        if not items:
+            log("[YT] ⚠️  channels.statistics — 0 items")
+            return None
+        count = int(items[0]["statistics"]["videoCount"])
+        log(f"[YT] videoCount = {count}")
+        return count
+    except Exception as e:
+        import traceback
+        log(f"[YT] ❌ get_video_count error: {e}\n{traceback.format_exc()}")
+        return None
 
 
 def get_latest_video(channel_id: str) -> dict | None:
     """
-    Return the latest non-Shorts video dict or None.
-
-    Quota cost: 1 unit (playlistItems.list) + 1 unit (videos.list batch)
-    vs old search.list which cost 100 units per call.
+    Stage 2 fetch: called ONLY when videoCount increases.
+    Returns the latest non-Shorts video dict {video_id, title} or None.
+    Costs 2 quota units (playlistItems + videos batch).
     """
     if not YT_KEYS.available:
         log("[YT] ❌ No YouTube API keys available.")
         return None
     try:
         playlist_id = _uploads_playlist_id(channel_id)
-        log(f"[YT] playlistItems.list → playlistId={playlist_id}")
+        log(f"[YT] playlistItems.list → {playlist_id}")
 
-        # ── Step 1: fetch latest 5 uploads (1 quota unit) ──────────────
+        # ── Fetch latest 8 uploads ──────────────────────────────────────
         r = _yt_get(
             "https://www.googleapis.com/youtube/v3/playlistItems",
-            {
-                "playlistId": playlist_id,
-                "part":       "snippet",
-                "maxResults": 5,
-            },
+            {"playlistId": playlist_id, "part": "snippet", "maxResults": 8},
         )
         if r is None:
             log("[YT] playlistItems.list returned None")
@@ -317,7 +356,6 @@ def get_latest_video(channel_id: str) -> dict | None:
             log(f"[YT] ⚠️  0 items — raw: {str(data)[:300]}")
             return None
 
-        # Build list of (video_id, title) preserving upload order
         candidates = []
         for item in items:
             snippet = item.get("snippet", {})
@@ -329,50 +367,46 @@ def get_latest_video(channel_id: str) -> dict | None:
                 log(f"[YT]   candidate: {vid_id} | {title}")
 
         if not candidates:
-            log("[YT] No valid videoIds found in playlist response.")
+            log("[YT] No valid videoIds in playlist response.")
             return None
 
-        # ── Step 2: batch-check durations for all candidates (1 quota unit) ──
+        # ── Batch duration check ────────────────────────────────────────
         vid_ids_str = ",".join(v for v, _ in candidates)
         r2 = _yt_get(
             "https://www.googleapis.com/youtube/v3/videos",
             {"id": vid_ids_str, "part": "contentDetails"},
         )
-
-        durations: dict[str, int] = {}   # video_id → total seconds
+        durations: dict[str, int] = {}
         if r2:
             for v_item in r2.json().get("items", []):
-                vid   = v_item["id"]
-                dur   = v_item["contentDetails"]["duration"]
-                secs  = parse_iso8601_duration(dur)
+                vid  = v_item["id"]
+                dur  = v_item["contentDetails"]["duration"]
+                secs = parse_iso8601_duration(dur)
                 durations[vid] = secs
                 log(f"[YT]   duration: {vid} → {dur} ({secs}s)")
         else:
-            log("[YT] ⚠️  videos.list failed — will treat all as non-Shorts")
+            log("[YT] ⚠️  videos.list failed — treating all as non-Shorts")
 
-        # ── Step 3: pick first non-Short ───────────────────────────────
+        # ── Return first non-Short ──────────────────────────────────────
         for vid_id, title in candidates:
-            secs   = durations.get(vid_id, 999)   # unknown → treat as long
-            is_sh  = secs <= 60
+            secs  = durations.get(vid_id, 999)
+            is_sh = secs <= 60
             log(f"[YT]   {vid_id}: {secs}s → {'SHORT ❌' if is_sh else 'VIDEO ✅'}")
             if not is_sh:
                 log(f"[YT] ✅ Selected: {vid_id} | {title}")
                 return {"video_id": vid_id, "title": title}
 
-        log(f"[YT] All {len(candidates)} candidates were Shorts — returning None")
+        log(f"[YT] All {len(candidates)} candidates were Shorts.")
         return None
 
     except Exception as e:
         import traceback
-        log(f"[YT] ❌ Exception in get_latest_video: {e}\n{traceback.format_exc()}")
+        log(f"[YT] ❌ get_latest_video error: {e}\n{traceback.format_exc()}")
         return None
 
 
 def is_short(video_id: str) -> bool:
-    """
-    Standalone short-check (used outside get_latest_video if ever needed).
-    Costs 1 quota unit.
-    """
+    """Standalone short-check. Costs 1 quota unit."""
     if not YT_KEYS.available:
         return False
     try:
@@ -392,7 +426,7 @@ def is_short(video_id: str) -> bool:
         log(f"[YT] is_short({video_id}): {duration} = {total_sec}s")
         return total_sec <= 60
     except Exception as e:
-        log(f"[YT] is_short({video_id}): exception {e} → assuming NOT short")
+        log(f"[YT] is_short({video_id}): {e} → assuming NOT short")
         return False
 
 
@@ -835,7 +869,7 @@ def monitor_channel(chat_id: int, market_key: str, stop_event: threading.Event):
 
         log(f"[Monitor] Thread started — market={market_key} channel={channel_id} chat={chat_id}")
 
-        # ── Sanity check: YouTube keys ──────────
+        # ── Sanity check ────────────────────────
         if not YT_KEYS.available:
             msg = "❌ No YouTube API keys available. Cannot monitor."
             log(f"[Monitor] {msg}")
@@ -844,22 +878,27 @@ def monitor_channel(chat_id: int, market_key: str, stop_event: threading.Event):
 
         log(f"[Monitor] YouTube keys: {YT_KEYS.status()}")
 
-        # ── Seed: grab current latest so we don't re-process it ──
-        log(f"[Monitor] Seeding — fetching latest video from channel {channel_id}…")
-        seed = get_latest_video(channel_id)
-        if seed:
-            last_vid_id = seed["video_id"]
-            log(f"[Monitor] Seeded with: {last_vid_id} — {seed['title']}")
-        else:
-            last_vid_id = None
-            log(f"[Monitor] ⚠️  Seed returned None — will treat first found video as new")
+        # ── Stage 1 SEED: record current videoCount as baseline ──────────
+        # We use channels.statistics (1 quota unit) — updates instantly.
+        # This is the same technique as the Google Apps Script watcher.
+        log(f"[Monitor] Seeding videoCount for channel {channel_id}…")
+        seed_count = get_video_count(channel_id)
+        last_count = seed_count   # None means API failed — handle gracefully
+
+        # Also seed the latest video ID so we can identify WHICH video is new
+        log(f"[Monitor] Seeding latest video ID…")
+        seed_vid = get_latest_video(channel_id)
+        last_vid_id = seed_vid["video_id"] if seed_vid else None
+
+        log(f"[Monitor] Seed — videoCount={last_count}  latest={last_vid_id}")
 
         bot.send_message(
             chat_id,
             f"👁 <b>Monitoring started</b> — {chan_label}\n"
             f"🕐 <b>Started:</b> <code>{ist_now()}</code>\n"
             f"🔑 Keys: <code>{YT_KEYS.status()}</code>\n"
-            f"⏱ Polling every <b>{POLL_INTERVAL}s</b>\n"
+            f"⏱ Polling every <b>{POLL_INTERVAL}s</b>  (videoCount tripwire)\n"
+            f"📊 Seeded count: <code>{last_count}</code>\n"
             f"📌 Seeded video: <code>{last_vid_id or 'none'}</code>\n\n"
             f"Use /stop to cancel.",
             parse_mode="HTML",
@@ -867,71 +906,116 @@ def monitor_channel(chat_id: int, market_key: str, stop_event: threading.Event):
 
         poll_count = 0
 
-        # ── Main poll loop ──────────────────────
+        # ── Main poll loop ──────────────────────────────────────────────
+        # Each poll: 1 quota unit (channels.statistics)
+        # Only on count increase: +2 units (playlistItems + videos.list)
         while not stop_event.is_set():
             stop_event.wait(POLL_INTERVAL)
             if stop_event.is_set():
-                log(f"[Monitor] Stop event received — exiting loop.")
+                log("[Monitor] Stop event received — exiting.")
                 break
 
             poll_count += 1
-            log(f"[Monitor] Poll #{poll_count} — checking {chan_label}…")
+            log(f"[Monitor] Poll #{poll_count} — checking videoCount…")
 
             try:
                 t_poll_start = datetime.datetime.utcnow()
-                latest = get_latest_video(channel_id)
 
-                if latest is None:
-                    log(f"[Monitor] Poll #{poll_count} — get_latest_video returned None")
+                # ── Stage 1: cheap videoCount check (1 unit) ─────────────
+                new_count = get_video_count(channel_id)
+
+                if new_count is None:
+                    log(f"[Monitor] Poll #{poll_count} — videoCount API failed")
                     bot.send_message(
                         chat_id,
                         f"⚠️ Poll #{poll_count} [{ist_now()}]\n"
-                        f"YouTube API returned nothing.\n"
-                        f"Keys: {YT_KEYS.status()}",
+                        f"videoCount API failed. Keys: {YT_KEYS.status()}",
+                    )
+                    continue
+
+                log(f"[Monitor] Poll #{poll_count} — count={new_count} (was {last_count})")
+
+                # Heartbeat every 10 polls — silent unless count unchanged
+                if poll_count % 10 == 0:
+                    bot.send_message(
+                        chat_id,
+                        f"💓 <b>Heartbeat</b> — poll #{poll_count}\n"
+                        f"🕐 <code>{ist_now()}</code>\n"
+                        f"📊 videoCount: <code>{new_count}</code> (no change)\n"
+                        f"🔑 Keys: {YT_KEYS.status()}",
+                        parse_mode="HTML",
+                    )
+
+                if last_count is not None and new_count <= last_count:
+                    log(f"[Monitor] Poll #{poll_count} — no new video.")
+                    continue
+
+                # ── Count increased — NEW VIDEO UPLOADED! ─────────────────
+                t_detected = ist_now()
+                diff = (new_count - last_count) if last_count else 1
+                log(f"[Monitor] 🆕 videoCount jumped {last_count}→{new_count} (+{diff}) at {t_detected}")
+                last_count = new_count
+
+                bot.send_message(
+                    chat_id,
+                    f"🔔 <b>New upload detected!</b>\n"
+                    f"🕐 <b>Detected at:</b> <code>{t_detected}</code>\n"
+                    f"📊 videoCount: <code>{last_count - diff} → {last_count}</code>\n"
+                    f"⏳ Fetching video details…",
+                    parse_mode="HTML",
+                )
+
+                # ── Stage 2: identify the new video (2 units) ────────────
+                latest = get_latest_video(channel_id)
+
+                if latest is None:
+                    log(f"[Monitor] ⚠️  get_latest_video returned None after count increase")
+                    bot.send_message(
+                        chat_id,
+                        f"⚠️ Count increased but couldn't fetch video details.\n"
+                        f"🕐 <code>{ist_now()}</code>\nWill retry next poll.",
+                        parse_mode="HTML",
                     )
                     continue
 
                 vid_id = latest["video_id"]
                 title  = latest["title"]
-                log(f"[Monitor] Poll #{poll_count} — latest: {vid_id} | {title}")
 
                 if vid_id == last_vid_id:
-                    log(f"[Monitor] Poll #{poll_count} — no new video.")
-                    if poll_count % 5 == 0:
-                        bot.send_message(
-                            chat_id,
-                            f"💓 <b>Heartbeat</b> — poll #{poll_count}\n"
-                            f"🕐 <code>{ist_now()}</code>\n"
-                            f"📺 Latest: <code>{vid_id}</code>\n"
-                            f"🔑 Keys: {YT_KEYS.status()}",
-                            parse_mode="HTML",
-                        )
+                    # Count went up but playlist still shows old video
+                    # (can happen with Shorts — count increments but we filter them)
+                    log(f"[Monitor] ⚠️  Same vid as before ({vid_id}) — likely a Short was uploaded, count still updated")
+                    bot.send_message(
+                        chat_id,
+                        f"⚠️ Count +1 but latest non-Short unchanged: <code>{vid_id}</code>\n"
+                        f"Likely a Short was uploaded. Continuing to watch.",
+                        parse_mode="HTML",
+                    )
                     continue
 
-                # ── New video detected ──────────
-                t_video_detected = ist_now()
-                log(f"[Monitor] 🆕 NEW VIDEO at {t_video_detected}: {vid_id} — {title}")
                 last_vid_id = vid_id
+                t_video_detected = ist_now()
+                log(f"[Monitor] ✅ New video confirmed: {vid_id} | {title}")
 
                 bot.send_message(
                     chat_id,
-                    f"🆕 <b>New video detected!</b>\n"
-                    f"🕐 <b>Detected at:</b> <code>{t_video_detected}</code>\n"
+                    f"🆕 <b>New video confirmed!</b>\n"
+                    f"🕐 <b>Confirmed at:</b> <code>{t_video_detected}</code>\n"
                     f"🎬 <a href='https://youtu.be/{vid_id}'>{title}</a>\n"
                     f"⏳ Fetching transcript…",
                     parse_mode="HTML",
                     disable_web_page_preview=True,
                 )
 
-                # ── Fetch transcript ────────────
-                t_transcript_start = datetime.datetime.utcnow()
+                # ── Transcript ────────────────────────────────────────────
+                t_tr_start = datetime.datetime.utcnow()
                 log(f"[Monitor] Fetching transcript for {vid_id}…")
                 transcript = fetch_transcript(vid_id)
-                t_transcript_end   = datetime.datetime.utcnow()
-                transcript_secs    = (t_transcript_end - t_transcript_start).total_seconds()
+                t_tr_end   = datetime.datetime.utcnow()
+                tr_secs    = (t_tr_end - t_tr_start).total_seconds()
 
                 if not transcript:
-                    log(f"[Monitor] ⚠️  Transcript not available yet for {vid_id}")
+                    log(f"[Monitor] ⚠️  Transcript not ready yet for {vid_id}")
                     bot.send_message(
                         chat_id,
                         f"⚠️ <b>Transcript not ready yet</b>\n"
@@ -939,45 +1023,61 @@ def monitor_channel(chat_id: int, market_key: str, stop_event: threading.Event):
                         f"Will retry on next poll.",
                         parse_mode="HTML",
                     )
-                    last_vid_id = None   # retry same video next tick
+                    last_vid_id = None   # reset → retry same video next tick
+                    last_count  = new_count - diff   # reset count → re-trigger next time
                     continue
 
-                t_transcript_done = ist_now()
-                log(f"[Monitor] ✅ Transcript fetched in {transcript_secs:.1f}s ({len(transcript)} chars)")
-
+                t_tr_done = ist_now()
+                log(f"[Monitor] ✅ Transcript fetched in {tr_secs:.1f}s ({len(transcript):,} chars)")
                 bot.send_message(
                     chat_id,
                     f"📄 <b>Transcript ready</b>\n"
-                    f"🕐 <b>Fetched at:</b> <code>{t_transcript_done}</code>\n"
-                    f"⏱ Took: <code>{transcript_secs:.1f}s</code>  |  "
+                    f"🕐 <b>Fetched at:</b> <code>{t_tr_done}</code>\n"
+                    f"⏱ Took: <code>{tr_secs:.1f}s</code>  |  "
                     f"Length: <code>{len(transcript):,} chars</code>\n"
-                    f"🔍 Running analysis…",
+                    f"🔍 Running analysis + trades…",
                     parse_mode="HTML",
                 )
 
-                # ── Analysis + trades ───────────
-                t_analysis_start = datetime.datetime.utcnow()
-                result           = format_results(transcript, market_key)
-                t_analysis_end   = datetime.datetime.utcnow()
-                analysis_secs    = (t_analysis_end - t_analysis_start).total_seconds()
-
-                # ── Total pipeline time ─────────
-                total_secs = (t_analysis_end - t_poll_start).total_seconds()
+                # ── Analysis + trades ─────────────────────────────────────
+                t_an_start  = datetime.datetime.utcnow()
+                result      = format_results(transcript, market_key)
+                t_an_end    = datetime.datetime.utcnow()
+                an_secs     = (t_an_end  - t_an_start).total_seconds()
+                total_secs  = (t_an_end  - t_poll_start).total_seconds()
 
                 timing_footer = (
                     f"\n\n<b>⏱ Pipeline timing</b>\n<pre>"
-                    f"Video detected : {t_video_detected}\n"
-                    f"Transcript done: {t_transcript_done}\n"
+                    f"Count detected : {t_detected}\n"
+                    f"Video confirmed: {t_video_detected}\n"
+                    f"Transcript done: {t_tr_done}\n"
                     f"Analysis done  : {ist_now()}\n"
-                    f"─────────────────────────────\n"
-                    f"Transcript fetch : {transcript_secs:.1f}s\n"
-                    f"Analysis + trades: {analysis_secs:.1f}s\n"
+                    f"{'─'*34}\n"
+                    f"Transcript fetch : {tr_secs:.1f}s\n"
+                    f"Analysis + trades: {an_secs:.1f}s\n"
                     f"Total pipeline   : {total_secs:.1f}s\n"
                     f"</pre>"
                 )
 
                 bot.send_message(chat_id, result + timing_footer, parse_mode="HTML")
-                log(f"[Monitor] ✅ Done. Pipeline took {total_secs:.1f}s total.")
+                log(f"[Monitor] ✅ Done. Total pipeline: {total_secs:.1f}s")
+
+                # ── AUTO-STOP after pipeline completes ────────────────────
+                # Job is done — transcript analysed, trades placed. Stop monitoring.
+                log(f"[Monitor] 🛑 Job complete — stopping monitor automatically.")
+                bot.send_message(
+                    chat_id,
+                    f"🛑 <b>Monitor auto-stopped</b>\n"
+                    f"🕐 <code>{ist_now()}</code>\n"
+                    f"✅ Pipeline complete — transcript analysed & trades placed.\n"
+                    f"Use /market to start monitoring the next video.",
+                    parse_mode="HTML",
+                )
+                # Clean up state
+                state = user_state.get(chat_id, {})
+                state["mode"] = "awaiting_link"
+                stop_event.set()   # signal the loop to exit
+                break              # exit immediately
 
             except Exception as e:
                 tb = traceback.format_exc()
@@ -993,11 +1093,13 @@ def monitor_channel(chat_id: int, market_key: str, stop_event: threading.Event):
                 except Exception:
                     pass
 
-        bot.send_message(
-            chat_id,
-            f"⛔ <b>Monitoring stopped</b>\n🕐 <code>{ist_now()}</code>",
-            parse_mode="HTML",
-        )
+        # Only send "stopped" message if stopped manually via /stop (not auto-stop which sends its own)
+        if not stop_event.is_set() or user_state.get(chat_id, {}).get("mode") != "awaiting_link":
+            bot.send_message(
+                chat_id,
+                f"⛔ <b>Monitoring stopped</b>\n🕐 <code>{ist_now()}</code>",
+                parse_mode="HTML",
+            )
         log(f"[Monitor] Thread exited cleanly for chat {chat_id}.")
 
     except Exception as fatal:

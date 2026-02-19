@@ -433,23 +433,44 @@ MARKET_CONFIGS = {
         "channel_key": "mrbeast",
         "testing": False,
         "word_groups": {
-            "Dollar":                   ("simple", r"\bdollar'?s?\b"),
+            # FIX: YouTube transcripts often write $30 million instead of "thirty million dollars"
+            # Both the word "dollar/dollars" AND "$<number>" patterns represent spoken dollar amounts.
+            # Examples from real transcripts: "$1 bunker", "$50 million", "$1 billion dollar bunker"
+            "Dollar":                   ("simple",
+                r"\bdollar'?s?\b"              # explicit word: dollar, dollars, dollar's
+                r"|\$\s*[\d,]+(?:\.\d+)?"      # $30  $1,000  $50.5  (no space before digit)
+                r"|\$\s*(?:one|two|three|four|five|six|seven|eight|nine|ten|"
+                r"twenty|thirty|forty|fifty|sixty|seventy|eighty|ninety|"
+                r"hundred|thousand|million|billion|trillion)"  # $fifty million, $ one billion
+            ),
             "Thousand/Million":         ("simple", r"\b(thousand|million|billion)'?s?\b"),
             "Challenge":                ("simple", r"\bchallenge'?s?\b"),
-            "Eliminated":               ("simple", r"\beliminate[ds]?\b"),
-            "Trap":                     ("simple", r"\btraps?'?s?\b"),
-            "Car/Supercar":             ("simple", r"\b(super)?car'?s?\b"),
+            # FIX: only "eliminated" and its plural/possessive count — not eliminate/eliminates
+            "Eliminated":               ("simple", r"\beliminated'?s?\b"),
+            # FIX: trap/traps/trap's + TRUE compounds (trapdoor, deathtrap, mousetrap etc.)
+            # \w*trap\w* would false-positive on "strap","bootstrap" — enumerate real ones
+            "Trap":                     ("simple",
+                r"\btrap'?s?\b"                              # trap, traps, trap's
+                r"|\btrapdoor'?s?\b"                         # trapdoor
+                r"|\b(?:death|fire|fly|rat|mouse|man|speed|tourist|poverty|"
+                r"sun|net|steam|wind|cold|heat|love|mind|speed)trap'?s?\b"
+                r"|\bbooby[\s\-]trap'?s?\b"                  # booby-trap / booby trap
+            ),
+            # FIX: car/cars/car's + compounds (racecar, sidecar, stockcar) + supercar
+            "Car/Supercar":             ("simple", r"\b\w*car'?s?\b"),
             "Tesla/Lamborghini":        ("simple", r"\b(tesla|lamborghini)'?s?\b"),
-            "Helicopter/Jet":           ("simple", r"\b(helicopter|jet)'?s?\b"),
+            # FIX: helicopter + jet/jets/jet's + compounds (jetpack, jetski, jet-ski)
+            "Helicopter/Jet":           ("simple", r"\bhelicopter'?s?\b|\bjet\w*'?s?\b"),
             "Island":                   ("simple", r"\bisland'?s?\b"),
             "Mystery Box":              ("simple", r"\bmystery\s+box(?:es|'?s)?\b"),
-            "Massive":                  ("simple", r"\bmassive\b"),
+            "Massive":                  ("simple", r"\bmassive'?s?\b"),
             "World's Biggest/Largest":  ("simple", r"\bworld'?s?\s+(biggest|largest)\b"),
             "Beast Games":              ("simple", r"\bbeast\s+games?\b"),
             "Feastables":               ("simple", r"\bfeastables?'?s?\b"),
             "MrBeast":                  ("simple", r"\bmr\.?\s*beast'?s?\b"),
-            "Insane":                   ("simple", r"\binsane\b"),
-            "Subscribe":                ("simple", r"\bsubscri(?:be'?s?|bed|bing|ber'?s?|ption'?s?)\b"),
+            "Insane":                   ("simple", r"\binsane'?s?\b"),
+            # FIX: only subscribe/subscribes/subscribe's — not subscribed/subscribing/subscriber
+            "Subscribe":                ("simple", r"\bsubscribe'?s?\b"),
             "Cocoa":                    ("simple", r"\bcocoa'?s?\b"),
             "Chocolate":                ("simple", r"\bchocolate'?s?\b"),
         },
@@ -650,42 +671,63 @@ def format_results(text: str, market_key: str) -> str:
 
     # ── Polymarket prices ────────────────────
     prices, token_ids = get_polymarket_data(slug, match_fn, word_groups)
-    opportunities, missing_data = [], []
 
-    if prices:
-        for cat, count in sorted_cnt.items():
-            thresh  = thresholds.get(cat, 1)
-            yes_p   = prices.get(cat)
-            if yes_p is None:
-                continue
-            no_p    = 1.0 - yes_p
-            tokens  = token_ids.get(cat, {})
-            yes_tok = tokens.get("yes")
-            no_tok  = tokens.get("no")
-            if count >= thresh:
-                if yes_p < 0.95 and yes_tok:
-                    edge = int((1.0 - yes_p) / yes_p * 100) if yes_p > 0 else 999
-                    opportunities.append((cat, "Yes", yes_tok, yes_p, edge))
-                elif yes_p < 0.95:
-                    missing_data.append(f"{cat} (Yes)")
+    # Always build a row for EVERY category — no silent skips
+    # Statuses: tradeable ✅, no token ⚠️, no market data ❓
+    tradeable   = []   # (cat, side, token, price, edge)  — can auto-trade
+    no_token    = []   # (cat, side, price, edge)          — price known, token missing
+    no_market   = []   # cat                               — not on Polymarket at all
+
+    for cat, count in sorted_cnt.items():
+        thresh  = thresholds.get(cat, 1)
+        yes_p   = prices.get(cat) if prices else None
+
+        if yes_p is None:
+            no_market.append(cat)
+            continue
+
+        no_p    = 1.0 - yes_p
+        tokens  = token_ids.get(cat, {})
+        yes_tok = tokens.get("yes")
+        no_tok  = tokens.get("no")
+
+        if count >= thresh:
+            side, p, tok = "Yes", yes_p, yes_tok
+        else:
+            side, p, tok = "No",  no_p,  no_tok
+
+        if p < 0.95:
+            edge = int((1.0 - p) / p * 100) if p > 0 else 999
+            if tok:
+                tradeable.append((cat, side, tok, p, edge))
             else:
-                if no_p < 0.95 and no_tok:
-                    edge = int((1.0 - no_p) / no_p * 100) if no_p > 0 else 999
-                    opportunities.append((cat, "No", no_tok, no_p, edge))
-                elif no_p < 0.95:
-                    missing_data.append(f"{cat} (No)")
+                no_token.append((cat, side, p, edge))
+        else:
+            # price ≥ 0.95 → market already priced certainty, skip trading
+            no_token.append((cat, side, p, 0))
 
-        poly_section = f"\n<b>🎯 Opportunities: {len(opportunities)}</b>"
-        if opportunities:
-            poly_section += "\n<pre>"
-            for cat, side, _, price, edge in opportunities:
-                poly_section += f"{cat:<28} {side:<4} {price:.2f}  ~{edge}%\n"
-            poly_section += "</pre>"
-        if missing_data:
-            poly_section += f"\n<i>⚠️ No token: {', '.join(missing_data[:5])}</i>"
-    else:
-        poly_section = "\n<i>⚠️ Failed to fetch Polymarket data.</i>"
-        opportunities = []
+    total_shown = len(tradeable) + len(no_token) + len(no_market)
+    poly_section = f"\n<b>🎯 All {total_shown} outcomes ({len(tradeable)} tradeable)</b>"
+
+    # Tradeable rows
+    if tradeable:
+        poly_section += "\n<pre>"
+        for cat, side, _, price, edge in tradeable:
+            poly_section += f"{cat:<28} {side:<4} {price:.2f}  ~{edge}%\n"
+        poly_section += "</pre>"
+
+    # Price known but no token
+    if no_token:
+        poly_section += "\n<b>⚠️ No token (price known):</b>\n<pre>"
+        for cat, side, price, edge in no_token:
+            poly_section += f"{cat:<28} {side:<4} {price:.2f}  ~{edge}%\n"
+        poly_section += "</pre>"
+
+    # Not on Polymarket at all
+    if no_market:
+        poly_section += f"\n<b>❓ No market data:</b> {', '.join(no_market)}"
+
+    opportunities = tradeable   # only tradeable ones get auto-traded
 
     # ── Auto-trade ───────────────────────────
     trade_results = []

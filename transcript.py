@@ -108,7 +108,7 @@ class YouTubeKeyRotator:
 YT_KEYS = YouTubeKeyRotator(os.environ.get("YOUTUBE_API_KEY"))
 
 POLYMARKET_SLUG_1  = os.environ.get("POLYMARKET_SLUG",  "what-will-mrbeast-say-during-his-next-youtube-video").strip()
-POLYMARKET_SLUG_2  = os.environ.get("POLYMARKET_SLUG_2","what-will-be-said-on-the-first-joe-rogan-experience-episode-of-the-week-february-22").strip()
+POLYMARKET_SLUG_2  = os.environ.get("POLYMARKET_SLUG_2","what-will-be-said-on-the-first-joe-rogan-experience-episode-of-the-week-march-1").strip()
 
 if not BOT_TOKEN:
     print("ERROR: BOT_TOKEN not set!")
@@ -134,6 +134,12 @@ CHANNELS = {
         "channel_id":  "UCjvgGbPPn-FgYeguc5nxG4A",
         "handle":      "@SouravJoshiVlogs",
         "label":       "🇮🇳 Sourav Joshi Vlogs (Testing)",
+        "testing":     True,
+    },
+    "mychannel": {
+        "channel_id":  "UC4e4sH4u80SGY_buwytEFqA",
+        "handle":      "@MyChannel",
+        "label":       "🧪 My Channel (Testing)",
         "testing":     True,
     },
 }
@@ -503,39 +509,156 @@ MARKET_CONFIGS = {
         "channel_key": "joerogan",
         "testing": False,
         "word_groups": {
-            "People":               ("simple", r"\bpeople'?s?\b"),
-            "Fuck/Fucking":         ("simple",
-                r"\bf+u+c+k(?:s|'?s|ing|ed|er'?s?|wit'?s?|head'?s?)?\b"
-                r"|\[\s*__\s*\]"
-                r"|mother\[\s*__\s*\](?:ing|er'?s?)?"),
-            "Really":               ("simple", r"\breally\b"),
-            "Interesting":          ("simple", r"\binteresting\b"),
-            "Jamie":                ("simple", r"\bjamie'?s?\b"),
-            "Dow Jones":            ("simple", r"\bdow\s+jones'?\b"),
-            "Pam/Bondi":            ("fullname", r"\bpam\s+bondi'?s?\b", r"\b(?:pam|bondi)'?s?\b"),
-            "Trump/MAGA":           ("simple", r"\btrump(?:'?s|ism|ist|ian)?\b|\bmaga\b"),
-            "Epstein":              ("simple", r"\bepstein'?s?\b"),
-            "DHS":                  ("simple", r"\bdhs'?s?\b"),
-            "Congress":             ("simple", r"\bcongress(?:'?s|ional|man|woman|person|people)?\b"),
-            "Shutdown":             ("simple", r"\bshutdowns?'?s?\b|\bshut\s+down\b"),
-            "Shooting":             ("simple", r"\bshooting'?s?\b"),
-            "War":                  ("simple", r"\bwars?'?s?\b|\bwar(?:fare|time|zone|lord|head|monger|torn|path|ring)'?s?\b"),
-            "Cocaine":              ("simple", r"\bcocaine'?s?\b"),
-            "Fentanyl":             ("simple", r"\bfentanyl'?s?\b"),
-            "Terrorist/Terrorism":  ("simple", r"\bterrorists?'?s?\b|\bterrorism'?s?\b|\b(?:counter|anti)[\s\-]terror(?:ist'?s?|ism'?s?)?\b"),
-            "Super Bowl/Big Game":  ("simple", r"\bsuper\s+bowl'?s?\b|\bbig\s+game'?s?\b"),
-            "Olympic/Olympics":     ("simple", r"\bolympic'?s?\b"),
-            "Valentine":            ("simple", r"\bvalentine'?s?\b"),
+            # ─────────────────────────────────────────────────────────────
+            # RESOLUTION RULES (Polymarket):
+            #   ✅ Base form counts
+            #   ✅ Plural (-s) and possessive ('s / s') count
+            #   ✅ Compound words count (goodwill, wartime, drugstore…)
+            #   ❌ Other derivations do NOT (goodness, presidential,
+            #       kissed/kissing, criminalization, peaceful…)
+            #   ❌ Verb conjugations do NOT (criminalizes, kissing…)
+            #   ℹ️  Full-name = 1 count (handled by "fullname" type)
+            # ─────────────────────────────────────────────────────────────
+
+            # ── 20+ threshold ─────────────────────────────────────────────
+            # good | goods | good's
+            # Compounds: goodwill, goodnight, goodbye, good-natured, etc.
+            # ❌ goodness (ness is not a standalone word → not a compound)
+            "Good":                 ("simple",
+                r"\bgood(?:'?s)?\b"                                         # good, goods, good's
+                r"|\bgood(?:will|night|bye|hearted|looking|natured|humored|ness(?=\s))'?s?\b"  # run-together compounds
+                r"|\bgood-\w+"                                              # hyphenated: good-natured etc.
+            ),
+
+            # ── 10+ threshold ─────────────────────────────────────────────
+            # america | americas | america's | american | americans | american's
+            # Compound: un-American
+            # ❌ americanize, americanization — derivations
+            "America/American":     ("simple",
+                r"\bamericas?\b|\bamerica'?s?\b"
+                r"|\bamericans?\b|\bamerican'?s?\b"
+                r"|\bun-?american'?s?\b"
+            ),
+
+            # dude | dudes | dude's
+            "Dude":                 ("simple", r"\bdudes?\b|\bdude'?s?\b"),
+
+            # ── 3+ threshold ──────────────────────────────────────────────
+            # president | presidents | president's
+            # administration | administrations | administration's
+            # ❌ presidential, presidentially — derivations, NOT counted
+            "President/Admin":      ("simple",
+                r"\bpresidents?\b|\bpresident'?s?\b"
+                r"|\badministrations?\b|\badministration'?s?\b"
+            ),
+
+            # peace | peaces | peace's
+            # war | wars | war's | compounds: warfare, wartime, warzone, warlord…
+            # ❌ peaceful, peacefully — derivations, NOT counted
+            "Peace/War":            ("simple",
+                r"\bpeaces?\b|\bpeace'?s?\b"
+                r"|\bwars?\b|\bwar'?s?\b"
+                r"|\bwar(?:fare|time|zone|lord|head|monger|path|ring|ship|torn)'?s?\b"
+                r"|\bcivil\s+war'?s?\b"
+            ),
+
+            # ── 1+ threshold (default) ────────────────────────────────────
+
+            # addiction | addictions | addiction's
+            # drug | drugs | drug's | compounds: drugstore, drug-free, drug-related…
+            # ❌ addictive, addicted, addicting — derivations
+            "Addiction/Drug":       ("simple",
+                r"\baddictions?\b|\baddiction'?s?\b"
+                r"|\bdrugs?\b|\bdrug'?s?\b"
+                r"|\bdrug-\w+"
+                r"|\bdrugstore'?s?\b"
+            ),
+
+            # criminal | criminals | criminal's
+            # criminalize | criminalize's (base + possessive only)
+            # ❌ criminalization, criminalized, criminalizing — NOT counted
+            "Criminal/Criminalize": ("simple",
+                r"\bcriminals?\b|\bcriminal'?s?\b"
+                r"|\bcriminali[sz]e'?s?\b"
+            ),
+
+            # amen | amens | amen's
+            "Amen":                 ("simple", r"\bamens?\b|\bamen'?s?\b"),
+
+            # kiss | kisses (plural) | kiss's / kiss' (possessive)
+            # ❌ kissed, kissing, kisser — other forms, NOT counted
+            "Kiss":                 ("simple", r"\bkiss\b|\bkisses\b|\bkiss'?s?\b"),
+
+            # UFO | UFOs | UFO's | U.F.O. variants
+            # alien | aliens | alien's
+            "UFO/Alien":            ("simple",
+                r"\bUFOs?\b|\bU\.F\.O\.?'?s?\b"
+                r"|\baliens?\b|\balien'?s?\b"
+            ),
+
+            # truth | truths | truth's
+            # ❌ truthful, truthfully — derivations, NOT counted
+            "Truth":                ("simple", r"\btruths?\b|\btruth'?s?\b"),
+
+            # Exact phrase only — any context counts per rules
+            "Black and White":      ("simple", r"\bblack\s+and\s+white\b"),
+
+            # prime minister | prime ministers | prime minister's
+            # NOTE: "PM" is an abbreviation, NOT a compound word → excluded
+            "Prime Minister":       ("simple",
+                r"\bprime\s+ministers?\b|\bprime\s+minister'?s?\b"
+            ),
+
+            # Full-name: "Donald Trump" = 1 mention (not 2)
+            # Standalone: donald | trump | trumps | trump's
+            # ❌ Trumpism, Trumpian, Trumpist — derivations, NOT counted
+            "Donald/Trump":         ("fullname",
+                r"\bdonald\s+trump'?s?\b",
+                r"\b(?:donald'?s?|trumps?\b|trump'?s?)\b"
+            ),
+
+            # "Bernie Sanders" = 1 | standalone bernie | sanders
+            "Bernie/Sanders":       ("fullname",
+                r"\bbernie\s+sanders'?s?\b",
+                r"\b(?:bernies?\b|bernie'?s?|sanderss?\b|sanders'?s?)\b"
+            ),
+
+            # "Hillary Clinton" = 1 | standalone hillary | clinton
+            "Hillary/Clinton":      ("fullname",
+                r"\bhillary\s+clinton'?s?\b",
+                r"\b(?:hillarys?\b|hillary'?s?|clintons?\b|clinton'?s?)\b"
+            ),
+
+            # AOC | A.O.C. — abbreviation, no plural form expected
+            "AOC":                  ("simple", r"\baoc\b|\ba\.o\.c\.?\b"),
+
+            # obama | obamas | obama's
+            "Obama":                ("simple", r"\bobamas?\b|\bobama'?s?\b"),
         },
         "thresholds": {
-            "People":      100,
-            "Fuck/Fucking": 20,
-            "Really":       10,
-            "Interesting":   5,
-            "Jamie":         5,
+            "Good":             20,
+            "America/American": 10,
+            "Dude":             10,
+            "President/Admin":   3,
+            "Peace/War":         3,
         },
         "default_threshold": 1,
         "match_market": "joerogan",
+    },
+
+    "mychannel": {
+        "slug":  None,
+        "label": "🧪 My Channel (Testing)",
+        "channel_key": "mychannel",
+        "testing": True,
+        "word_groups": {
+            # Count base + plural + possessive only (per Polymarket rules)
+            "Hello": ("simple", r"\bhello'?s?\b"),
+            "Hi":    ("simple", r"\bhi'?s?\b"),
+        },
+        "thresholds": {},
+        "default_threshold": 1,
+        "match_market": "mychannel",
     },
 
     "souravjoshi": {
@@ -590,29 +713,44 @@ def match_market_mrbeast(q: str) -> str | None:
 
 
 def match_market_joerogan(q):
+    """
+    Match a Polymarket question string to a joerogan word_groups category.
+    March 1 week markets.
+    """
     ql = q.lower()
-    if "valentine" in ql:                                   return "Valentine"
-    if "people" in ql and "100+" in ql:                     return "People"
-    if ("fuck" in ql or "fucking" in ql) and "20+" in ql:  return "Fuck/Fucking"
-    if "really" in ql and "10+" in ql:                      return "Really"
-    if "interesting" in ql and "5+" in ql:                  return "Interesting"
-    if "jamie" in ql and "5+" in ql:                        return "Jamie"
-    if "dow jones" in ql or ("dow" in ql and "jones" in ql): return "Dow Jones"
-    if "pam" in ql or "bondi" in ql:                        return "Pam/Bondi"
-    if "trump" in ql or "maga" in ql:                       return "Trump/MAGA"
-    if "epstein" in ql:                                      return "Epstein"
-    if "dhs"     in ql:                                      return "DHS"
-    if "congress" in ql:                                     return "Congress"
-    if "shutdown" in ql or "shut down" in ql:               return "Shutdown"
-    if "shooting" in ql:                                     return "Shooting"
-    if "war"      in ql:                                     return "War"
-    if "cocaine"  in ql:                                     return "Cocaine"
-    if "fentanyl" in ql:                                     return "Fentanyl"
-    if "terrorist" in ql or "terrorism" in ql:              return "Terrorist/Terrorism"
-    if "super bowl" in ql or "big game" in ql:              return "Super Bowl/Big Game"
-    if "olympic"  in ql:                                     return "Olympic/Olympics"
+
+    # ── High-threshold markets (count in question) ────────────────────
+    if "good" in ql and "20" in ql:                                    return "Good"
+    if ("america" in ql or "american" in ql) and "10" in ql:           return "America/American"
+    if "dude" in ql and "10" in ql:                                    return "Dude"
+
+    # ── Medium-threshold markets ──────────────────────────────────────
+    if ("president" in ql or "administration" in ql) and "3" in ql:   return "President/Admin"
+    if ("peace" in ql or "war" in ql) and "3" in ql:                  return "Peace/War"
+
+    # ── Default-threshold (1+) — order matters for specificity ───────
+    if "prime minister" in ql:                                         return "Prime Minister"
+    if "black and white" in ql:                                        return "Black and White"
+    if "addiction" in ql or "drug" in ql:                              return "Addiction/Drug"
+    if "criminal" in ql or "criminalize" in ql:                        return "Criminal/Criminalize"
+    if "amen" in ql:                                                   return "Amen"
+    if "kiss" in ql:                                                   return "Kiss"
+    if "ufo" in ql or "alien" in ql:                                   return "UFO/Alien"
+    if "truth" in ql:                                                  return "Truth"
+    if "donald" in ql or ("trump" in ql and "donald" not in ql):      return "Donald/Trump"
+    # also catch bare "trump" questions
+    if "trump" in ql:                                                  return "Donald/Trump"
+    if "bernie" in ql or "sanders" in ql:                              return "Bernie/Sanders"
+    if "hillary" in ql or "clinton" in ql:                             return "Hillary/Clinton"
+    if "aoc" in ql:                                                    return "AOC"
+    if "obama" in ql:                                                  return "Obama"
+    # peace/war at threshold 1 (catch questions without "3" in them)
+    if "peace" in ql or "war" in ql:                                   return "Peace/War"
     return None
 
+
+def match_market_mychannel(q):
+    return None   # no Polymarket sub-markets for testing
 
 def match_market_souravjoshi(q):
     return None
@@ -621,6 +759,7 @@ def match_market_souravjoshi(q):
 MARKET_MATCHERS = {
     "mrbeast":      match_market_mrbeast,
     "joerogan":     match_market_joerogan,
+    "mychannel":    match_market_mychannel,
     "souravjoshi":  match_market_souravjoshi,
 }
 
@@ -1070,6 +1209,7 @@ def market_keyboard():
     kb.add(
         types.InlineKeyboardButton("🎬 MrBeast YouTube",         callback_data="market_mrbeast"),
         types.InlineKeyboardButton("🎙️ Joe Rogan Experience",    callback_data="market_joerogan"),
+        types.InlineKeyboardButton("🧪 My Channel (Testing)",    callback_data="market_mychannel"),
         types.InlineKeyboardButton("🇮🇳 Sourav Joshi (Testing)", callback_data="market_souravjoshi"),
     )
     return kb

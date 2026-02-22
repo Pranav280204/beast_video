@@ -27,15 +27,10 @@ WALLET_ADDRESS     = os.environ.get("WALLET_ADDRESS")
 AUTO_TRADE         = os.environ.get("AUTO_TRADE", "false").lower() == "true"
 TRADE_AMOUNT       = float(os.environ.get("TRADE_AMOUNT", "10"))
 MIN_TRADE_AMOUNT   = float(os.environ.get("MIN_TRADE_AMOUNT", "1"))
-POLL_INTERVAL      = int(os.environ.get("POLL_INTERVAL", "60"))   # seconds between checks
+POLL_INTERVAL      = int(os.environ.get("POLL_INTERVAL", "2"))   # seconds between checks
 
 # ─────────────────────────────────────────────
 # YOUTUBE API KEY ROTATOR
-# Supports comma-separated keys:
-#   YOUTUBE_API_KEY=key1,key2,key3
-# Rotates round-robin on every call.
-# If a key returns 403 (quota exceeded) it is
-# automatically skipped and the next key is tried.
 # ─────────────────────────────────────────────
 
 class YouTubeKeyRotator:
@@ -43,7 +38,7 @@ class YouTubeKeyRotator:
         self._keys  = [k.strip() for k in (raw_env or "").split(",") if k.strip()]
         self._index = 0
         self._lock  = threading.Lock()
-        self._exhausted: set[int] = set()   # indices of quota-exceeded keys
+        self._exhausted: set[int] = set()
 
     @property
     def available(self) -> bool:
@@ -54,7 +49,6 @@ class YouTubeKeyRotator:
         return len(self._keys)
 
     def next_key(self) -> str | None:
-        """Return next available key (round-robin), or None if all exhausted."""
         with self._lock:
             if not self._keys:
                 return None
@@ -66,25 +60,43 @@ class YouTubeKeyRotator:
                     return key
                 self._index = (self._index + 1) % len(self._keys)
                 if self._index == start:
-                    return None   # all keys exhausted
+                    return None  # all keys exhausted
 
-    def mark_exhausted(self, key: str):
-        """Call when a key returns HTTP 403 (quota exceeded)."""
+    def mark_exhausted(self, key: str, chat_id: int | None = None):
+        """Mark a key as quota-exceeded and optionally notify via Telegram."""
         with self._lock:
             try:
                 idx = self._keys.index(key)
                 self._exhausted.add(idx)
                 remaining = len(self._keys) - len(self._exhausted)
-                print(f"⚠️  YouTube key #{idx+1} quota exceeded. "
-                      f"{remaining}/{len(self._keys)} keys remaining.")
+                msg = (f"⚠️ YouTube key #{idx+1} quota exceeded. "
+                       f"{remaining}/{len(self._keys)} keys remaining.")
+                print(msg, flush=True)
+                # Notify on Telegram if we have a chat_id
+                if chat_id and bot:
+                    try:
+                        bot.send_message(chat_id, msg)
+                    except Exception:
+                        pass
+                # If ALL keys now exhausted, send a louder warning
+                if remaining == 0 and chat_id and bot:
+                    try:
+                        bot.send_message(
+                            chat_id,
+                            "🚨 <b>ALL YouTube API keys exhausted!</b>\n"
+                            "Monitoring cannot continue until quota resets at midnight UTC.\n"
+                            "Use /stop to clean up.",
+                            parse_mode="HTML",
+                        )
+                    except Exception:
+                        pass
             except ValueError:
                 pass
 
     def reset_exhausted(self):
-        """Call at midnight to refresh daily quota."""
         with self._lock:
             self._exhausted.clear()
-            print("🔄 YouTube API key quotas reset.")
+            print("🔄 YouTube API key quotas reset.", flush=True)
 
     def status(self) -> str:
         with self._lock:
@@ -128,14 +140,18 @@ CHANNELS = {
 
 # ─────────────────────────────────────────────
 # USER STATE
-# Format per chat_id:
-#   market_key       – selected market
-#   mode             – "ask_monitor" | "monitoring" | "awaiting_link" | "ask_testing"
-#   testing          – bool (for souravjoshi)
-#   monitor_thread   – threading.Thread or None
-#   stop_event       – threading.Event or None
 # ─────────────────────────────────────────────
 user_state: dict[int, dict] = {}
+
+
+# ─────────────────────────────────────────────
+# LOGGING
+# ─────────────────────────────────────────────
+
+def log(msg: str):
+    import datetime
+    ts = datetime.datetime.utcnow().strftime("%H:%M:%S")
+    print(f"[{ts}] {msg}", flush=True)
 
 
 # ─────────────────────────────────────────────
@@ -185,7 +201,6 @@ def extract_transcript_text(data) -> str:
 
 
 def fetch_transcript(video_id: str) -> str | None:
-    """Fetch transcript from youtube-transcript.io."""
     if not API_TOKEN:
         return None
     try:
@@ -226,40 +241,37 @@ def get_token_id_for_outcome(market, target_outcome: str) -> str | None:
 
 
 # ─────────────────────────────────────────────
-# YOUTUBE DATA API — LATEST NON-SHORT VIDEO
+# YOUTUBE DATA API
 # ─────────────────────────────────────────────
 
-def _yt_get(url: str, params: dict) -> "requests.Response | None":
+def _yt_get(url: str, params: dict, chat_id: int | None = None) -> "requests.Response | None":
     """
-    Make a YouTube Data API GET request using key rotation.
-    Automatically retries with the next key if HTTP 403 (quota exceeded).
-    Returns the Response object, or None if all keys are exhausted / unavailable.
+    YouTube Data API GET with key rotation.
+    Retries with next key on 403 (quota exceeded).
+    Sends Telegram alert on quota hit if chat_id provided.
     """
     if not YT_KEYS.available:
-        print("⚠️  All YouTube API keys exhausted.")
+        log("⚠️  All YouTube API keys exhausted.")
         return None
 
-    # Strip any pre-existing key from params — we inject it per-attempt
     base_params = {k: v for k, v in params.items() if k != "key"}
 
     tried = 0
     while tried < YT_KEYS.count:
         key = YT_KEYS.next_key()
         if key is None:
-            print("⚠️  No YouTube API keys available.")
+            log("⚠️  No YouTube API keys available.")
             return None
-        request_params = {**base_params, "key": key}   # one clean key per request
+        request_params = {**base_params, "key": key}
         try:
             r = requests.get(url, params=request_params, timeout=15)
             if r.status_code == 403:
-                log(f"[YT] ⚠️  403 quota hit on key #{self._keys.index(key)+1 if key in self._keys else '?'}. Rotating…")
-                YT_KEYS.mark_exhausted(key)
+                log(f"[YT] ⚠️  403 quota hit. Rotating key…")
+                YT_KEYS.mark_exhausted(key, chat_id=chat_id)
                 tried += 1
                 continue
             if r.status_code == 400:
-                log(f"[YT] ❌ 400 Bad Request")
-                log(f"[YT]    Requested URL: {r.url}")
-                log(f"[YT]    Response body: {r.text[:500]}")
+                log(f"[YT] ❌ 400 Bad Request — {r.text[:300]}")
                 return None
             r.raise_for_status()
             return r
@@ -272,50 +284,41 @@ def _yt_get(url: str, params: dict) -> "requests.Response | None":
     return None
 
 
-
-
-
 def _uploads_playlist_id(channel_id: str) -> str:
-    """UC... → UU...  (guaranteed YouTube convention, zero API cost)"""
+    """UC… → UU… (YouTube convention, zero API cost)"""
     return "UU" + channel_id[2:]
 
 
-# ─────────────────────────────────────────────────────────────────────
-# TWO-STAGE DETECTION  (same technique as the Google Apps Script above)
-#
-#  Stage 1 — TRIPWIRE (1 quota unit/poll)
-#    channels?part=statistics → videoCount
-#    Increments INSTANTLY when YouTube publishes a video.
-#    No cache lag. This is what the GAS script used.
-#
-#  Stage 2 — FETCH (2 quota units, only when count increases)
-#    playlistItems.list + videos.list(batch) → latest non-Short
-#
-#  Total quota per poll:  1 unit  (vs 2 before, and 100+ with search.list)
-#  With 5 keys @ 4s interval: 50,000/day ÷ 1 = 50,000 polls possible
-# ─────────────────────────────────────────────────────────────────────
+def parse_iso8601_duration(duration: str) -> int:
+    """Convert ISO 8601 duration string to total seconds. Returns -1 for PT0S (unpopulated)."""
+    if not duration or duration in ("PT0S", "P0D", ""):
+        return -1   # ← KEY FIX: -1 means "unknown / not yet populated"
+    m = re.match(r"PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?", duration)
+    if not m:
+        return -1
+    h, mi, s = (int(x or 0) for x in m.groups())
+    total = h * 3600 + mi * 60 + s
+    return total if total > 0 else -1
 
-def get_video_count(channel_id: str) -> int | None:
+
+def get_video_count(channel_id: str, chat_id: int | None = None) -> int | None:
     """
-    Stage 1 tripwire: returns total video count for a channel.
-    Costs 1 quota unit. Updates instantly on new upload — no cache lag.
-    Returns None on API failure.
+    Stage 1 tripwire — returns total video count for a channel.
+    Costs 1 quota unit. Updates instantly on new upload.
     """
     if not YT_KEYS.available:
-        log("[YT] ❌ No YouTube API keys available.")
         return None
     try:
         log(f"[YT] channels.statistics → {channel_id}")
         r = _yt_get(
             "https://www.googleapis.com/youtube/v3/channels",
             {"id": channel_id, "part": "statistics"},
+            chat_id=chat_id,
         )
         if r is None:
-            log("[YT] channels.statistics returned None")
             return None
         items = r.json().get("items", [])
         if not items:
-            log("[YT] ⚠️  channels.statistics — 0 items")
             return None
         count = int(items[0]["statistics"]["videoCount"])
         log(f"[YT] videoCount = {count}")
@@ -326,36 +329,32 @@ def get_video_count(channel_id: str) -> int | None:
         return None
 
 
-def get_latest_video(channel_id: str) -> dict | None:
+def get_latest_video(channel_id: str, chat_id: int | None = None) -> dict | None:
     """
-    Stage 2 fetch: called ONLY when videoCount increases.
-    Returns the latest non-Shorts video dict {video_id, title} or None.
+    Stage 2 fetch — called ONLY when videoCount increases.
+    Returns latest non-Shorts video dict {video_id, title} or None.
     Costs 2 quota units (playlistItems + videos batch).
+
+    FIX: If duration == -1 (PT0S / not yet populated by YouTube),
+    we wait 20 seconds and retry ONCE. If still -1, we assume it is
+    NOT a Short and return it — a 10-minute video should never be dropped
+    just because the API hasn't finished processing its metadata.
     """
     if not YT_KEYS.available:
-        log("[YT] ❌ No YouTube API keys available.")
         return None
-    try:
+
+    def _fetch_candidates():
         playlist_id = _uploads_playlist_id(channel_id)
         log(f"[YT] playlistItems.list → {playlist_id}")
-
-        # ── Fetch latest 8 uploads ──────────────────────────────────────
         r = _yt_get(
             "https://www.googleapis.com/youtube/v3/playlistItems",
             {"playlistId": playlist_id, "part": "snippet", "maxResults": 8},
+            chat_id=chat_id,
         )
         if r is None:
-            log("[YT] playlistItems.list returned None")
-            return None
-
-        data  = r.json()
-        items = data.get("items", [])
+            return []
+        items = r.json().get("items", [])
         log(f"[YT] playlistItems OK — {len(items)} items")
-
-        if not items:
-            log(f"[YT] ⚠️  0 items — raw: {str(data)[:300]}")
-            return None
-
         candidates = []
         for item in items:
             snippet = item.get("snippet", {})
@@ -365,16 +364,16 @@ def get_latest_video(channel_id: str) -> dict | None:
             if vid_id:
                 candidates.append((vid_id, title))
                 log(f"[YT]   candidate: {vid_id} | {title}")
+        return candidates
 
+    def _fetch_durations(candidates):
         if not candidates:
-            log("[YT] No valid videoIds in playlist response.")
-            return None
-
-        # ── Batch duration check ────────────────────────────────────────
+            return {}
         vid_ids_str = ",".join(v for v, _ in candidates)
         r2 = _yt_get(
             "https://www.googleapis.com/youtube/v3/videos",
             {"id": vid_ids_str, "part": "contentDetails"},
+            chat_id=chat_id,
         )
         durations: dict[str, int] = {}
         if r2:
@@ -385,58 +384,52 @@ def get_latest_video(channel_id: str) -> dict | None:
                 durations[vid] = secs
                 log(f"[YT]   duration: {vid} → {dur} ({secs}s)")
         else:
-            log("[YT] ⚠️  videos.list failed — treating all as non-Shorts")
+            log("[YT] ⚠️  videos.list failed — will treat all as non-Shorts")
+        return durations
+
+    try:
+        candidates = _fetch_candidates()
+        if not candidates:
+            log("[YT] No candidates from playlist.")
+            return None
+
+        durations = _fetch_durations(candidates)
+
+        # ── Check if any duration came back as -1 (PT0S / unpopulated) ──
+        # This is the core bug fix: YouTube takes 10-40s to populate
+        # contentDetails.duration after an upload. If we see -1, wait and retry.
+        unpopulated = [vid for vid, _ in candidates if durations.get(vid, -1) == -1]
+        if unpopulated:
+            log(f"[YT] ⚠️  {len(unpopulated)} video(s) have PT0S duration (metadata not ready). "
+                f"Waiting 20s then retrying…")
+            time.sleep(20)
+            durations = _fetch_durations(candidates)   # retry once
 
         # ── Return first non-Short ──────────────────────────────────────
         for vid_id, title in candidates:
-            secs  = durations.get(vid_id, 999)
+            secs = durations.get(vid_id, -1)
+
+            if secs == -1:
+                # Still unpopulated after retry → ASSUME NOT A SHORT.
+                # A real Short would have finished processing by now.
+                # A long video that just got uploaded may still lag.
+                # Better to analyse a Short by mistake than to miss a long video.
+                log(f"[YT]   {vid_id}: duration still unknown → treating as NON-Short ✅")
+                return {"video_id": vid_id, "title": title}
+
             is_sh = secs <= 60
             log(f"[YT]   {vid_id}: {secs}s → {'SHORT ❌' if is_sh else 'VIDEO ✅'}")
             if not is_sh:
                 log(f"[YT] ✅ Selected: {vid_id} | {title}")
                 return {"video_id": vid_id, "title": title}
 
-        log(f"[YT] All {len(candidates)} candidates were Shorts.")
+        log(f"[YT] All {len(candidates)} candidates are confirmed Shorts (duration ≤ 60s).")
         return None
 
     except Exception as e:
         import traceback
         log(f"[YT] ❌ get_latest_video error: {e}\n{traceback.format_exc()}")
         return None
-
-
-def is_short(video_id: str) -> bool:
-    """Standalone short-check. Costs 1 quota unit."""
-    if not YT_KEYS.available:
-        return False
-    try:
-        r = _yt_get(
-            "https://www.googleapis.com/youtube/v3/videos",
-            {"id": video_id, "part": "contentDetails"},
-        )
-        if r is None:
-            log(f"[YT] is_short({video_id}): no response → assuming NOT short")
-            return False
-        items = r.json().get("items", [])
-        if not items:
-            log(f"[YT] is_short({video_id}): 0 items → assuming NOT short")
-            return False
-        duration  = items[0]["contentDetails"]["duration"]
-        total_sec = parse_iso8601_duration(duration)
-        log(f"[YT] is_short({video_id}): {duration} = {total_sec}s")
-        return total_sec <= 60
-    except Exception as e:
-        log(f"[YT] is_short({video_id}): {e} → assuming NOT short")
-        return False
-
-
-def parse_iso8601_duration(duration: str) -> int:
-    """Convert ISO 8601 duration string to total seconds."""
-    m = re.match(r"PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?", duration)
-    if not m:
-        return 0
-    h, mi, s = (int(x or 0) for x in m.groups())
-    return h * 3600 + mi * 60 + s
 
 
 # ─────────────────────────────────────────────
@@ -467,33 +460,25 @@ MARKET_CONFIGS = {
         "channel_key": "mrbeast",
         "testing": False,
         "word_groups": {
-            # FIX: YouTube transcripts often write $30 million instead of "thirty million dollars"
-            # Both the word "dollar/dollars" AND "$<number>" patterns represent spoken dollar amounts.
-            # Examples from real transcripts: "$1 bunker", "$50 million", "$1 billion dollar bunker"
             "Dollar":                   ("simple",
-                r"\bdollar'?s?\b"              # explicit word: dollar, dollars, dollar's
-                r"|\$\s*[\d,]+(?:\.\d+)?"      # $30  $1,000  $50.5  (no space before digit)
+                r"\bdollar'?s?\b"
+                r"|\$\s*[\d,]+(?:\.\d+)?"
                 r"|\$\s*(?:one|two|three|four|five|six|seven|eight|nine|ten|"
                 r"twenty|thirty|forty|fifty|sixty|seventy|eighty|ninety|"
-                r"hundred|thousand|million|billion|trillion)"  # $fifty million, $ one billion
+                r"hundred|thousand|million|billion|trillion)"
             ),
             "Thousand/Million":         ("simple", r"\b(thousand|million|billion)'?s?\b"),
             "Challenge":                ("simple", r"\bchallenge'?s?\b"),
-            # FIX: only "eliminated" and its plural/possessive count — not eliminate/eliminates
             "Eliminated":               ("simple", r"\beliminated'?s?\b"),
-            # FIX: trap/traps/trap's + TRUE compounds (trapdoor, deathtrap, mousetrap etc.)
-            # \w*trap\w* would false-positive on "strap","bootstrap" — enumerate real ones
             "Trap":                     ("simple",
-                r"\btrap'?s?\b"                              # trap, traps, trap's
-                r"|\btrapdoor'?s?\b"                         # trapdoor
+                r"\btrap'?s?\b"
+                r"|\btrapdoor'?s?\b"
                 r"|\b(?:death|fire|fly|rat|mouse|man|speed|tourist|poverty|"
                 r"sun|net|steam|wind|cold|heat|love|mind|speed)trap'?s?\b"
-                r"|\bbooby[\s\-]trap'?s?\b"                  # booby-trap / booby trap
+                r"|\bbooby[\s\-]trap'?s?\b"
             ),
-            # FIX: car/cars/car's + compounds (racecar, sidecar, stockcar) + supercar
             "Car/Supercar":             ("simple", r"\b\w*car'?s?\b"),
             "Tesla/Lamborghini":        ("simple", r"\b(tesla|lamborghini)'?s?\b"),
-            # FIX: helicopter + jet/jets/jet's + compounds (jetpack, jetski, jet-ski)
             "Helicopter/Jet":           ("simple", r"\bhelicopter'?s?\b|\bjet\w*'?s?\b"),
             "Island":                   ("simple", r"\bisland'?s?\b"),
             "Mystery Box":              ("simple", r"\bmystery\s+box(?:es|'?s)?\b"),
@@ -503,7 +488,6 @@ MARKET_CONFIGS = {
             "Feastables":               ("simple", r"\bfeastables?'?s?\b"),
             "MrBeast":                  ("simple", r"\bmr\.?\s*beast'?s?\b"),
             "Insane":                   ("simple", r"\binsane'?s?\b"),
-            # FIX: only subscribe/subscribes/subscribe's — not subscribed/subscribing/subscriber
             "Subscribe":                ("simple", r"\bsubscribe'?s?\b"),
             "Cocoa":                    ("simple", r"\bcocoa'?s?\b"),
             "Chocolate":                ("simple", r"\bchocolate'?s?\b"),
@@ -554,7 +538,6 @@ MARKET_CONFIGS = {
         "match_market": "joerogan",
     },
 
-    # ── TESTING ONLY — no Polymarket slug ──────────────────────────────────
     "souravjoshi": {
         "slug":  None,
         "label": "🇮🇳 Sourav Joshi Vlogs (Testing)",
@@ -575,24 +558,10 @@ MARKET_CONFIGS = {
 # ─────────────────────────────────────────────
 
 def match_market_mrbeast(q: str) -> str | None:
-    """
-    Extract the TARGET TERM from a Polymarket question like:
-      'Will MrBeast say challenge during his next YouTube video?'
-      'Will MrBeast say dollar 10+ times during his next YouTube video?'
-
-    Strategy: strip the boilerplate and match the remaining term to a category.
-    This avoids the old bug where every question matched 'MrBeast' because
-    all questions contain the word 'mrbeast' in the boilerplate.
-    """
     ql = q.lower()
+    m = re.search(r"\bsay\s+(.+?)(?:\s+\d+\+\s+times?|\s+during\b)", ql)
+    term = m.group(1).strip() if m else ql
 
-    # ── Extract the core term between "say" and "during/10+/5+/3+" ──────
-    # Pattern: "will mrbeast say <TERM> [N+ times] during..."
-    import re as _re
-    m = _re.search(r"\bsay\s+(.+?)(?:\s+\d+\+\s+times?|\s+during\b)", ql)
-    term = m.group(1).strip() if m else ql   # fallback to full question
-
-    # ── Match extracted term to category ────────────────────────────────
     if "beast games"                      in term: return "Beast Games"
     if "mystery box"                      in term: return "Mystery Box"
     if "world" in term and ("biggest" in term or "largest" in term):
@@ -619,6 +588,7 @@ def match_market_mrbeast(q: str) -> str | None:
     if "car"          in term:                     return "Car/Supercar"
     return None
 
+
 def match_market_joerogan(q):
     ql = q.lower()
     if "valentine" in ql:                                   return "Valentine"
@@ -643,8 +613,10 @@ def match_market_joerogan(q):
     if "olympic"  in ql:                                     return "Olympic/Olympics"
     return None
 
+
 def match_market_souravjoshi(q):
-    return None   # no Polymarket sub-markets for testing
+    return None
+
 
 MARKET_MATCHERS = {
     "mrbeast":      match_market_mrbeast,
@@ -710,7 +682,6 @@ def format_results(text: str, market_key: str) -> str:
     sorted_cnt = dict(sorted(counts.items()))
     total      = sum(sorted_cnt.values())
 
-    # ── Word count table — always shows every outcome ───────────────────
     msg = f"<b>📊 Word Counts — {config['label']}</b>\n<pre>"
     for cat, count in sorted_cnt.items():
         thresh = thresholds.get(cat, 1)
@@ -719,20 +690,15 @@ def format_results(text: str, market_key: str) -> str:
         elif count > 0:
             msg += f"{cat:<28} {count:>4} ❌\n"
         else:
-            msg += f"{cat:<28} {count:>4} ➖\n"   # zero — always shown
+            msg += f"{cat:<28} {count:>4} ➖\n"
     msg += f"{'─'*34}\nTOTAL: {total}\n</pre>"
 
     if is_testing:
         return f"<b>🧪 TEST MODE — {config['label']}</b>\n\n{msg}\n<i>No Polymarket trades (testing only).</i>"
 
-    # ── Polymarket prices ────────────────────
     prices, token_ids = get_polymarket_data(slug, match_fn, word_groups)
 
-    # Always build a row for EVERY category — no silent skips
-    # Statuses: tradeable ✅, no token ⚠️, no market data ❓
-    tradeable   = []   # (cat, side, token, price, edge)  — can auto-trade
-    no_token    = []   # (cat, side, price, edge)          — price known, token missing
-    no_market   = []   # cat                               — not on Polymarket at all
+    tradeable, no_token, no_market = [], [], []
 
     for cat, count in sorted_cnt.items():
         thresh  = thresholds.get(cat, 1)
@@ -759,33 +725,28 @@ def format_results(text: str, market_key: str) -> str:
             else:
                 no_token.append((cat, side, p, edge))
         else:
-            # price ≥ 0.95 → market already priced certainty, skip trading
             no_token.append((cat, side, p, 0))
 
     total_shown = len(tradeable) + len(no_token) + len(no_market)
     poly_section = f"\n<b>🎯 All {total_shown} outcomes ({len(tradeable)} tradeable)</b>"
 
-    # Tradeable rows
     if tradeable:
         poly_section += "\n<pre>"
         for cat, side, _, price, edge in tradeable:
             poly_section += f"{cat:<28} {side:<4} {price:.2f}  ~{edge}%\n"
         poly_section += "</pre>"
 
-    # Price known but no token
     if no_token:
         poly_section += "\n<b>⚠️ No token (price known):</b>\n<pre>"
         for cat, side, price, edge in no_token:
             poly_section += f"{cat:<28} {side:<4} {price:.2f}  ~{edge}%\n"
         poly_section += "</pre>"
 
-    # Not on Polymarket at all
     if no_market:
         poly_section += f"\n<b>❓ No market data:</b> {', '.join(no_market)}"
 
-    opportunities = tradeable   # only tradeable ones get auto-traded
+    opportunities = tradeable
 
-    # ── Auto-trade ───────────────────────────
     trade_results = []
     if AUTO_TRADE and PRIVATE_KEY and opportunities:
         import datetime
@@ -808,14 +769,14 @@ def format_results(text: str, market_key: str) -> str:
             client.set_api_creds(client.create_or_derive_api_creds())
             for cat, side, tok, price, edge in opportunities:
                 try:
-                    t_before       = datetime.datetime.utcnow()
-                    args           = MarketOrderArgs(token_id=tok, amount=actual_amt, side=BUY)
-                    signed         = client.create_market_order(args)
-                    resp           = client.post_order(signed, OrderType.FOK)
-                    t_after        = datetime.datetime.utcnow()
-                    elapsed        = (t_after - t_before).total_seconds()
-                    trade_ts       = (_ist())
-                    status         = resp.get("status", "")
+                    t_before = datetime.datetime.utcnow()
+                    args     = MarketOrderArgs(token_id=tok, amount=actual_amt, side=BUY)
+                    signed   = client.create_market_order(args)
+                    resp     = client.post_order(signed, OrderType.FOK)
+                    t_after  = datetime.datetime.utcnow()
+                    elapsed  = (t_after - t_before).total_seconds()
+                    trade_ts = _ist()
+                    status   = resp.get("status", "")
                     if resp.get("order_id") or resp.get("success") or status in ("matched","live","open"):
                         trade_results.append(f"✅ {cat[:16]:<16} {side}  ${actual_amt}  @{trade_ts}  ({elapsed:.2f}s)")
                     else:
@@ -837,31 +798,25 @@ def format_results(text: str, market_key: str) -> str:
 
 # ─────────────────────────────────────────────
 # AUTO-MONITOR THREAD
-# Polls YouTube every POLL_INTERVAL seconds.
-# When a NEW video appears it transcribes and
-# calls format_results, then sends to the user.
+#
+# CHANGES vs original:
+#  • No heartbeat messages — silence until a new video is found
+#  • Polling STOPS immediately when videoCount increases (before transcript fetch)
+#  • Duration=PT0S → waits 20s and retries → defaults to NON-Short if still unknown
+#  • Quota errors send Telegram alerts
+#  • 2-second poll interval recommended
 # ─────────────────────────────────────────────
-
-def log(msg: str):
-    """Print with immediate flush so logs appear in real time."""
-    import datetime
-    ts = datetime.datetime.utcnow().strftime("%H:%M:%S")
-    print(f"[{ts}] {msg}", flush=True)
-
 
 def monitor_channel(chat_id: int, market_key: str, stop_event: threading.Event):
     import datetime
     import traceback
 
+    def ist_now() -> str:
+        utc = datetime.datetime.utcnow()
+        ist = utc + datetime.timedelta(hours=5, minutes=30)
+        return ist.strftime("%d %b %Y  %H:%M:%S IST")
+
     try:
-        import datetime, traceback
-
-        def ist_now() -> str:
-            """Return current time in IST (UTC+5:30) as HH:MM:SS string."""
-            utc = datetime.datetime.utcnow()
-            ist = utc + datetime.timedelta(hours=5, minutes=30)
-            return ist.strftime("%d %b %Y  %H:%M:%S IST")
-
         config     = MARKET_CONFIGS[market_key]
         chan_key   = config["channel_key"]
         channel_id = CHANNELS[chan_key]["channel_id"]
@@ -869,25 +824,18 @@ def monitor_channel(chat_id: int, market_key: str, stop_event: threading.Event):
 
         log(f"[Monitor] Thread started — market={market_key} channel={channel_id} chat={chat_id}")
 
-        # ── Sanity check ────────────────────────
         if not YT_KEYS.available:
             msg = "❌ No YouTube API keys available. Cannot monitor."
             log(f"[Monitor] {msg}")
             bot.send_message(chat_id, msg)
             return
 
-        log(f"[Monitor] YouTube keys: {YT_KEYS.status()}")
+        # ── Seed: record current videoCount as baseline ──────────────────
+        log(f"[Monitor] Seeding videoCount…")
+        last_count = get_video_count(channel_id, chat_id=chat_id)
 
-        # ── Stage 1 SEED: record current videoCount as baseline ──────────
-        # We use channels.statistics (1 quota unit) — updates instantly.
-        # This is the same technique as the Google Apps Script watcher.
-        log(f"[Monitor] Seeding videoCount for channel {channel_id}…")
-        seed_count = get_video_count(channel_id)
-        last_count = seed_count   # None means API failed — handle gracefully
-
-        # Also seed the latest video ID so we can identify WHICH video is new
         log(f"[Monitor] Seeding latest video ID…")
-        seed_vid = get_latest_video(channel_id)
+        seed_vid = get_latest_video(channel_id, chat_id=chat_id)
         last_vid_id = seed_vid["video_id"] if seed_vid else None
 
         log(f"[Monitor] Seed — videoCount={last_count}  latest={last_vid_id}")
@@ -897,9 +845,10 @@ def monitor_channel(chat_id: int, market_key: str, stop_event: threading.Event):
             f"👁 <b>Monitoring started</b> — {chan_label}\n"
             f"🕐 <b>Started:</b> <code>{ist_now()}</code>\n"
             f"🔑 Keys: <code>{YT_KEYS.status()}</code>\n"
-            f"⏱ Polling every <b>{POLL_INTERVAL}s</b>  (videoCount tripwire)\n"
+            f"⏱ Polling every <b>{POLL_INTERVAL}s</b>\n"
             f"📊 Seeded count: <code>{last_count}</code>\n"
             f"📌 Seeded video: <code>{last_vid_id or 'none'}</code>\n\n"
+            f"🔕 <i>No further messages until a new video is detected.</i>\n"
             f"Use /stop to cancel.",
             parse_mode="HTML",
         )
@@ -907,8 +856,6 @@ def monitor_channel(chat_id: int, market_key: str, stop_event: threading.Event):
         poll_count = 0
 
         # ── Main poll loop ──────────────────────────────────────────────
-        # Each poll: 1 quota unit (channels.statistics)
-        # Only on count increase: +2 units (playlistItems + videos.list)
         while not stop_event.is_set():
             stop_event.wait(POLL_INTERVAL)
             if stop_event.is_set():
@@ -916,91 +863,78 @@ def monitor_channel(chat_id: int, market_key: str, stop_event: threading.Event):
                 break
 
             poll_count += 1
-            log(f"[Monitor] Poll #{poll_count} — checking videoCount…")
 
             try:
-                t_poll_start = datetime.datetime.utcnow()
-
-                # ── Stage 1: cheap videoCount check (1 unit) ─────────────
-                new_count = get_video_count(channel_id)
+                # ── Stage 1: cheap videoCount check ──────────────────────
+                new_count = get_video_count(channel_id, chat_id=chat_id)
 
                 if new_count is None:
+                    # API failed — quota hit notification is sent inside mark_exhausted
                     log(f"[Monitor] Poll #{poll_count} — videoCount API failed")
-                    bot.send_message(
-                        chat_id,
-                        f"⚠️ Poll #{poll_count} [{ist_now()}]\n"
-                        f"videoCount API failed. Keys: {YT_KEYS.status()}",
-                    )
+                    if not YT_KEYS.available:
+                        log("[Monitor] All keys exhausted — stopping monitor.")
+                        stop_event.set()
+                        break
                     continue
 
                 log(f"[Monitor] Poll #{poll_count} — count={new_count} (was {last_count})")
 
-                # Heartbeat every 10 polls — silent unless count unchanged
-                if poll_count % 10 == 0:
-                    bot.send_message(
-                        chat_id,
-                        f"💓 <b>Heartbeat</b> — poll #{poll_count}\n"
-                        f"🕐 <code>{ist_now()}</code>\n"
-                        f"📊 videoCount: <code>{new_count}</code> (no change)\n"
-                        f"🔑 Keys: {YT_KEYS.status()}",
-                        parse_mode="HTML",
-                    )
-
                 if last_count is not None and new_count <= last_count:
-                    log(f"[Monitor] Poll #{poll_count} — no new video.")
+                    # No change — silent (no heartbeat)
                     continue
 
-                # ── Count increased — NEW VIDEO UPLOADED! ─────────────────
+                # ── Count increased → NEW VIDEO! ──────────────────────────
+                # STOP POLLING IMMEDIATELY so we don't burn quota during fetch
+                stop_event.set()
+
                 t_detected = ist_now()
                 diff = (new_count - last_count) if last_count else 1
-                log(f"[Monitor] 🆕 videoCount jumped {last_count}→{new_count} (+{diff}) at {t_detected}")
-                last_count = new_count
+                log(f"[Monitor] 🆕 videoCount {last_count}→{new_count} (+{diff}) at {t_detected}")
 
                 bot.send_message(
                     chat_id,
                     f"🔔 <b>New upload detected!</b>\n"
-                    f"🕐 <b>Detected at:</b> <code>{t_detected}</code>\n"
-                    f"📊 videoCount: <code>{last_count - diff} → {last_count}</code>\n"
+                    f"🕐 <code>{t_detected}</code>\n"
+                    f"📊 videoCount: <code>{last_count} → {new_count}</code>\n"
                     f"⏳ Fetching video details…",
                     parse_mode="HTML",
                 )
 
-                # ── Stage 2: identify the new video (2 units) ────────────
-                latest = get_latest_video(channel_id)
+                # ── Stage 2: identify the new video ──────────────────────
+                latest = get_latest_video(channel_id, chat_id=chat_id)
 
                 if latest is None:
-                    log(f"[Monitor] ⚠️  get_latest_video returned None after count increase")
+                    log(f"[Monitor] ⚠️  get_latest_video returned None")
                     bot.send_message(
                         chat_id,
-                        f"⚠️ Count increased but couldn't fetch video details.\n"
-                        f"🕐 <code>{ist_now()}</code>\nWill retry next poll.",
+                        f"⚠️ Count increased but couldn't identify the new non-Short video.\n"
+                        f"🕐 <code>{ist_now()}</code>\n"
+                        f"Use /market to restart monitoring.",
                         parse_mode="HTML",
                     )
-                    continue
+                    break
 
                 vid_id = latest["video_id"]
                 title  = latest["title"]
 
                 if vid_id == last_vid_id:
-                    # Count went up but playlist still shows old video
-                    # (can happen with Shorts — count increments but we filter them)
-                    log(f"[Monitor] ⚠️  Same vid as before ({vid_id}) — likely a Short was uploaded, count still updated")
+                    log(f"[Monitor] ⚠️  Same vid as before ({vid_id}) — likely a Short was uploaded")
                     bot.send_message(
                         chat_id,
-                        f"⚠️ Count +1 but latest non-Short unchanged: <code>{vid_id}</code>\n"
-                        f"Likely a Short was uploaded. Continuing to watch.",
+                        f"⚠️ Count +1 but latest non-Short is unchanged: <code>{vid_id}</code>\n"
+                        f"Likely a Short was uploaded — monitoring stopped.\n"
+                        f"Use /market to restart.",
                         parse_mode="HTML",
                     )
-                    continue
+                    break
 
-                last_vid_id = vid_id
                 t_video_detected = ist_now()
                 log(f"[Monitor] ✅ New video confirmed: {vid_id} | {title}")
 
                 bot.send_message(
                     chat_id,
                     f"🆕 <b>New video confirmed!</b>\n"
-                    f"🕐 <b>Confirmed at:</b> <code>{t_video_detected}</code>\n"
+                    f"🕐 <b>Confirmed:</b> <code>{t_video_detected}</code>\n"
                     f"🎬 <a href='https://youtu.be/{vid_id}'>{title}</a>\n"
                     f"⏳ Fetching transcript…",
                     parse_mode="HTML",
@@ -1009,75 +943,56 @@ def monitor_channel(chat_id: int, market_key: str, stop_event: threading.Event):
 
                 # ── Transcript ────────────────────────────────────────────
                 t_tr_start = datetime.datetime.utcnow()
-                log(f"[Monitor] Fetching transcript for {vid_id}…")
                 transcript = fetch_transcript(vid_id)
                 t_tr_end   = datetime.datetime.utcnow()
                 tr_secs    = (t_tr_end - t_tr_start).total_seconds()
 
                 if not transcript:
-                    log(f"[Monitor] ⚠️  Transcript not ready yet for {vid_id}")
+                    log(f"[Monitor] ⚠️  Transcript not ready for {vid_id}")
                     bot.send_message(
                         chat_id,
                         f"⚠️ <b>Transcript not ready yet</b>\n"
                         f"🕐 <code>{ist_now()}</code>\n"
-                        f"Will retry on next poll.",
+                        f"Video: <a href='https://youtu.be/{vid_id}'>{title}</a>\n\n"
+                        f"Try again manually with /market → paste the URL once transcript is available.",
                         parse_mode="HTML",
+                        disable_web_page_preview=True,
                     )
-                    last_vid_id = None   # reset → retry same video next tick
-                    last_count  = new_count - diff   # reset count → re-trigger next time
-                    continue
+                    break
 
                 t_tr_done = ist_now()
                 log(f"[Monitor] ✅ Transcript fetched in {tr_secs:.1f}s ({len(transcript):,} chars)")
-                bot.send_message(
-                    chat_id,
-                    f"📄 <b>Transcript ready</b>\n"
-                    f"🕐 <b>Fetched at:</b> <code>{t_tr_done}</code>\n"
-                    f"⏱ Took: <code>{tr_secs:.1f}s</code>  |  "
-                    f"Length: <code>{len(transcript):,} chars</code>\n"
-                    f"🔍 Running analysis + trades…",
-                    parse_mode="HTML",
-                )
 
                 # ── Analysis + trades ─────────────────────────────────────
-                t_an_start  = datetime.datetime.utcnow()
-                result      = format_results(transcript, market_key)
-                t_an_end    = datetime.datetime.utcnow()
-                an_secs     = (t_an_end  - t_an_start).total_seconds()
-                total_secs  = (t_an_end  - t_poll_start).total_seconds()
+                t_an_start = datetime.datetime.utcnow()
+                result     = format_results(transcript, market_key)
+                t_an_end   = datetime.datetime.utcnow()
+                an_secs    = (t_an_end - t_an_start).total_seconds()
+                total_secs = (t_an_end - t_tr_start).total_seconds()
 
                 timing_footer = (
                     f"\n\n<b>⏱ Pipeline timing</b>\n<pre>"
-                    f"Count detected : {t_detected}\n"
-                    f"Video confirmed: {t_video_detected}\n"
-                    f"Transcript done: {t_tr_done}\n"
-                    f"Analysis done  : {ist_now()}\n"
+                    f"Detected     : {t_detected}\n"
+                    f"Video ID     : {t_video_detected}\n"
+                    f"Transcript   : {t_tr_done}\n"
+                    f"Analysis done: {ist_now()}\n"
                     f"{'─'*34}\n"
-                    f"Transcript fetch : {tr_secs:.1f}s\n"
-                    f"Analysis + trades: {an_secs:.1f}s\n"
-                    f"Total pipeline   : {total_secs:.1f}s\n"
+                    f"Transcript : {tr_secs:.1f}s\n"
+                    f"Analysis   : {an_secs:.1f}s\n"
+                    f"Total      : {total_secs:.1f}s\n"
                     f"</pre>"
                 )
 
                 bot.send_message(chat_id, result + timing_footer, parse_mode="HTML")
-                log(f"[Monitor] ✅ Done. Total pipeline: {total_secs:.1f}s")
+                log(f"[Monitor] ✅ Done. Pipeline: {total_secs:.1f}s")
 
-                # ── AUTO-STOP after pipeline completes ────────────────────
-                # Job is done — transcript analysed, trades placed. Stop monitoring.
-                log(f"[Monitor] 🛑 Job complete — stopping monitor automatically.")
                 bot.send_message(
                     chat_id,
-                    f"🛑 <b>Monitor auto-stopped</b>\n"
-                    f"🕐 <code>{ist_now()}</code>\n"
-                    f"✅ Pipeline complete — transcript analysed & trades placed.\n"
-                    f"Use /market to start monitoring the next video.",
+                    f"✅ <b>Done!</b> Pipeline complete — transcript analysed & trades placed.\n"
+                    f"Use /market to monitor the next video.",
                     parse_mode="HTML",
                 )
-                # Clean up state
-                state = user_state.get(chat_id, {})
-                state["mode"] = "awaiting_link"
-                stop_event.set()   # signal the loop to exit
-                break              # exit immediately
+                break   # already stopped via stop_event.set() above
 
             except Exception as e:
                 tb = traceback.format_exc()
@@ -1093,23 +1008,29 @@ def monitor_channel(chat_id: int, market_key: str, stop_event: threading.Event):
                 except Exception:
                     pass
 
-        # Only send "stopped" message if stopped manually via /stop (not auto-stop which sends its own)
-        if not stop_event.is_set() or user_state.get(chat_id, {}).get("mode") != "awaiting_link":
+        # Only send "stopped" if manually stopped (not auto-stopped after detection)
+        state = user_state.get(chat_id, {})
+        if state.get("mode") == "monitoring":
             bot.send_message(
                 chat_id,
                 f"⛔ <b>Monitoring stopped</b>\n🕐 <code>{ist_now()}</code>",
                 parse_mode="HTML",
             )
-        log(f"[Monitor] Thread exited cleanly for chat {chat_id}.")
+        state["mode"] = "awaiting_link"
+        log(f"[Monitor] Thread exited for chat {chat_id}.")
 
     except Exception as fatal:
         tb = traceback.format_exc()
-        log(f"[Monitor] 💀 FATAL crash in monitor thread: {fatal}\n{tb}")
+        log(f"[Monitor] 💀 FATAL crash: {fatal}\n{tb}")
         try:
+            import datetime
+            utc = datetime.datetime.utcnow()
+            ist = utc + datetime.timedelta(hours=5, minutes=30)
+            ist_str = ist.strftime("%d %b %Y  %H:%M:%S IST")
             bot.send_message(
                 chat_id,
                 f"💀 <b>Monitor thread crashed</b>\n"
-                f"🕐 <code>{ist_now()}</code>\n"
+                f"🕐 <code>{ist_str}</code>\n"
                 f"<code>{str(fatal)[:300]}</code>\n\nUse /market to restart.",
                 parse_mode="HTML",
             )
@@ -1118,7 +1039,7 @@ def monitor_channel(chat_id: int, market_key: str, stop_event: threading.Event):
 
 
 def start_monitoring(chat_id: int, market_key: str):
-    stop_monitoring(chat_id)   # kill any existing thread first
+    stop_monitoring(chat_id)
     stop_event = threading.Event()
     t = threading.Thread(
         target=monitor_channel,
@@ -1136,8 +1057,8 @@ def stop_monitoring(chat_id: int):
     ev = state.get("stop_event")
     if ev:
         ev.set()
-    user_state.get(chat_id, {}).pop("stop_event",     None)
-    user_state.get(chat_id, {}).pop("monitor_thread", None)
+    state.pop("stop_event",     None)
+    state.pop("monitor_thread", None)
 
 
 # ─────────────────────────────────────────────
@@ -1215,13 +1136,14 @@ def cmd_status(message):
     label   = MARKET_CONFIGS[mk]["label"] if mk else "None"
     bot.reply_to(
         message,
-        f"<b>Status</b>\nMarket: {label}\nMode: {mode}",
+        f"<b>Status</b>\nMarket: {label}\nMode: {mode}\n"
+        f"YouTube API keys: {YT_KEYS.status()}",
         parse_mode="HTML",
     )
 
 
 # ─────────────────────────────────────────────
-# CALLBACK QUERY HANDLER (inline buttons)
+# CALLBACK QUERY HANDLER
 # ─────────────────────────────────────────────
 
 @bot.callback_query_handler(func=lambda call: True)
@@ -1229,7 +1151,6 @@ def handle_callback(call: types.CallbackQuery):
     chat_id = call.message.chat.id
     data    = call.data
 
-    # ── Market selection ─────────────────────
     if data.startswith("market_"):
         mk = data[len("market_"):]
         if mk not in MARKET_CONFIGS:
@@ -1243,12 +1164,10 @@ def handle_callback(call: types.CallbackQuery):
             parse_mode="HTML",
         )
 
-        # Sourav Joshi — ask about testing first
         if config.get("testing"):
             bot.send_message(
                 chat_id,
-                "🧪 <b>Sourav Joshi</b> is in <b>testing mode</b> (no real Polymarket trades).\n"
-                "The bot will track occurrences of <b>अवंतिका</b> in new videos.\n\n"
+                "🧪 <b>Sourav Joshi</b> is in <b>testing mode</b> (no real trades).\n\n"
                 "Do you want to run the bot for the <b>next uploaded video</b>?",
                 parse_mode="HTML",
                 reply_markup=yesno_keyboard("monitor_yes", "monitor_no"),
@@ -1256,7 +1175,7 @@ def handle_callback(call: types.CallbackQuery):
         else:
             bot.send_message(
                 chat_id,
-                f"Do you want to run the bot for the <b>next video uploaded</b> on "
+                f"Do you want to auto-monitor for the <b>next video</b> on "
                 f"<b>{config['label']}</b>?",
                 parse_mode="HTML",
                 reply_markup=yesno_keyboard("monitor_yes", "monitor_no"),
@@ -1264,7 +1183,6 @@ def handle_callback(call: types.CallbackQuery):
         bot.answer_callback_query(call.id)
         return
 
-    # ── Monitor yes/no ───────────────────────
     if data == "monitor_yes":
         state = user_state.get(chat_id)
         if not state:
@@ -1275,8 +1193,8 @@ def handle_callback(call: types.CallbackQuery):
         if not YT_KEYS.available:
             bot.send_message(
                 chat_id,
-                "⚠️ <b>YOUTUBE_API_KEY</b> is not set or all keys are exhausted.\n"
-                "Please set it (comma-separated for multiple keys) and restart the bot.",
+                "⚠️ <b>YOUTUBE_API_KEY</b> not set or all keys exhausted.\n"
+                "Set comma-separated keys and restart.",
                 parse_mode="HTML",
             )
             bot.answer_callback_query(call.id)
@@ -1292,7 +1210,7 @@ def handle_callback(call: types.CallbackQuery):
         bot.edit_message_reply_markup(chat_id, call.message.message_id, reply_markup=None)
         bot.send_message(
             chat_id,
-            "📎 Please send a <b>YouTube URL/ID</b> or paste <b>transcript text</b> directly.",
+            "📎 Send a <b>YouTube URL/ID</b> or paste <b>transcript text</b> directly.",
             parse_mode="HTML",
         )
         bot.answer_callback_query(call.id)
@@ -1314,29 +1232,17 @@ def handle_text(message: types.Message):
 
     state = user_state.get(chat_id)
     if not state or "market_key" not in state:
-        bot.reply_to(
-            message,
-            "👋 Please select a market first:",
-            reply_markup=market_keyboard(),
-        )
+        bot.reply_to(message, "👋 Please select a market first:", reply_markup=market_keyboard())
         return
 
     mode = state.get("mode")
     if mode == "monitoring":
-        bot.reply_to(
-            message,
-            "ℹ️ Auto-monitor is active. Use /stop to cancel it first.",
-        )
+        bot.reply_to(message, "ℹ️ Auto-monitor is active. Use /stop to cancel first.")
         return
-
     if mode == "ask_monitor":
-        bot.reply_to(
-            message,
-            "Please answer the auto-monitor question above, or use /market to restart.",
-        )
+        bot.reply_to(message, "Please answer the auto-monitor question above, or use /market to restart.")
         return
 
-    # ── Normal flow: "awaiting_link" or anything else ──
     market_key = state["market_key"]
     video_id   = extract_video_id(user_text)
 
@@ -1371,11 +1277,7 @@ def handle_document(message: types.Message):
 
     state = user_state.get(chat_id)
     if not state or "market_key" not in state:
-        bot.reply_to(
-            message,
-            "👋 Please select a market first:",
-            reply_markup=market_keyboard(),
-        )
+        bot.reply_to(message, "👋 Please select a market first:", reply_markup=market_keyboard())
         return
 
     bot.reply_to(message, "📄 Processing…")
@@ -1390,22 +1292,7 @@ def handle_document(message: types.Message):
 
 
 # ─────────────────────────────────────────────
-# STARTUP
-# ─────────────────────────────────────────────
-
-print("Bot starting…")
-print(f"  Markets: {', '.join(MARKET_CONFIGS.keys())}")
-print(f"  AUTO_TRADE:    {AUTO_TRADE}")
-print(f"  TRADE_AMOUNT:  ${max(TRADE_AMOUNT, MIN_TRADE_AMOUNT)}")
-print(f"  POLL_INTERVAL: {POLL_INTERVAL}s")
-print(f"  YouTube API:   {'✅ ' + YT_KEYS.status() if YT_KEYS.available else '❌ NOT SET'}")
-print(f"  Transcript API:{'✅' if API_TOKEN else '❌ NOT SET'}")
-print(f"  Wallet:        {WALLET_ADDRESS[:10] + '…' if WALLET_ADDRESS else 'Not set'}")
-
-# ─────────────────────────────────────────────
-# DAILY QUOTA RESET — fires at midnight UTC
-# Google resets YouTube API quotas at midnight PT
-# (≈07:00 UTC). We reset at 00:00 UTC to be safe.
+# DAILY QUOTA RESET at midnight UTC
 # ─────────────────────────────────────────────
 
 def _midnight_reset_loop():
@@ -1419,5 +1306,19 @@ def _midnight_reset_loop():
         YT_KEYS.reset_exhausted()
 
 threading.Thread(target=_midnight_reset_loop, daemon=True).start()
+
+
+# ─────────────────────────────────────────────
+# STARTUP
+# ─────────────────────────────────────────────
+
+print("Bot starting…")
+print(f"  Markets: {', '.join(MARKET_CONFIGS.keys())}")
+print(f"  AUTO_TRADE:    {AUTO_TRADE}")
+print(f"  TRADE_AMOUNT:  ${max(TRADE_AMOUNT, MIN_TRADE_AMOUNT)}")
+print(f"  POLL_INTERVAL: {POLL_INTERVAL}s")
+print(f"  YouTube API:   {'✅ ' + YT_KEYS.status() if YT_KEYS.available else '❌ NOT SET'}")
+print(f"  Transcript API:{'✅' if API_TOKEN else '❌ NOT SET'}")
+print(f"  Wallet:        {(WALLET_ADDRESS[:10] + '…') if WALLET_ADDRESS else 'Not set'}")
 
 bot.infinity_polling()

@@ -145,6 +145,17 @@ CHANNELS = {
 }
 
 # ─────────────────────────────────────────────
+# JRE MMA SHOW TITLE FILTER
+# Titles matching this pattern are skipped when
+# monitoring the joerogan channel — only full
+# Joe Rogan Experience episodes count per rules.
+# ─────────────────────────────────────────────
+JRE_MMA_PATTERN = re.compile(r"JRE\s+MMA\s+Show|MMA\s+Show", re.IGNORECASE)
+
+def is_jre_mma_episode(title: str) -> bool:
+    return bool(JRE_MMA_PATTERN.search(title))
+
+# ─────────────────────────────────────────────
 # USER STATE
 # ─────────────────────────────────────────────
 user_state: dict[int, dict] = {}
@@ -298,7 +309,7 @@ def _uploads_playlist_id(channel_id: str) -> str:
 def parse_iso8601_duration(duration: str) -> int:
     """Convert ISO 8601 duration string to total seconds. Returns -1 for PT0S (unpopulated)."""
     if not duration or duration in ("PT0S", "P0D", ""):
-        return -1   # ← KEY FIX: -1 means "unknown / not yet populated"
+        return -1   # -1 means "unknown / not yet populated"
     m = re.match(r"PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?", duration)
     if not m:
         return -1
@@ -335,11 +346,16 @@ def get_video_count(channel_id: str, chat_id: int | None = None) -> int | None:
         return None
 
 
-def get_latest_video(channel_id: str, chat_id: int | None = None) -> dict | None:
+def get_latest_video(channel_id: str, chat_id: int | None = None,
+                     skip_mma: bool = False) -> dict | None:
     """
     Stage 2 fetch — called ONLY when videoCount increases.
     Returns latest non-Shorts video dict {video_id, title} or None.
     Costs 2 quota units (playlistItems + videos batch).
+
+    skip_mma=True  →  skips any video whose title matches JRE_MMA_PATTERN.
+                       Set this when monitoring the joerogan channel so that
+                       JRE MMA Show episodes are ignored per Polymarket rules.
 
     FIX: If duration == -1 (PT0S / not yet populated by YouTube),
     we wait 20 seconds and retry ONCE. If still -1, we assume it is
@@ -399,11 +415,21 @@ def get_latest_video(channel_id: str, chat_id: int | None = None) -> dict | None
             log("[YT] No candidates from playlist.")
             return None
 
+        # ── FIX #6: Filter out JRE MMA Show episodes when required ──────
+        if skip_mma:
+            filtered = [(vid, title) for vid, title in candidates
+                        if not is_jre_mma_episode(title)]
+            skipped = len(candidates) - len(filtered)
+            if skipped:
+                log(f"[YT] ⏭  Skipped {skipped} JRE MMA Show episode(s).")
+            candidates = filtered
+            if not candidates:
+                log("[YT] All candidates were JRE MMA Show episodes — nothing to process.")
+                return None
+
         durations = _fetch_durations(candidates)
 
         # ── Check if any duration came back as -1 (PT0S / unpopulated) ──
-        # This is the core bug fix: YouTube takes 10-40s to populate
-        # contentDetails.duration after an upload. If we see -1, wait and retry.
         unpopulated = [vid for vid, _ in candidates if durations.get(vid, -1) == -1]
         if unpopulated:
             log(f"[YT] ⚠️  {len(unpopulated)} video(s) have PT0S duration (metadata not ready). "
@@ -417,9 +443,6 @@ def get_latest_video(channel_id: str, chat_id: int | None = None) -> dict | None
 
             if secs == -1:
                 # Still unpopulated after retry → ASSUME NOT A SHORT.
-                # A real Short would have finished processing by now.
-                # A long video that just got uploaded may still lag.
-                # Better to analyse a Short by mistake than to miss a long video.
                 log(f"[YT]   {vid_id}: duration still unknown → treating as NON-Short ✅")
                 return {"video_id": vid_id, "title": title}
 
@@ -508,6 +531,8 @@ MARKET_CONFIGS = {
         "label": "🎙️ Joe Rogan Experience",
         "channel_key": "joerogan",
         "testing": False,
+        # FIX #6: skip JRE MMA Show episodes during monitoring
+        "skip_mma": True,
         "word_groups": {
             # ─────────────────────────────────────────────────────────────
             # RESOLUTION RULES (Polymarket):
@@ -521,40 +546,31 @@ MARKET_CONFIGS = {
             # ─────────────────────────────────────────────────────────────
 
             # ── 20+ threshold ─────────────────────────────────────────────
-            # good | goods | good's
-            # Compounds: goodwill, goodnight, goodbye, good-natured, etc.
-            # ❌ goodness (ness is not a standalone word → not a compound)
+            # FIX #1: Added negative lookahead (?!ness\b|ful\b|ly\b) so that
+            # "goodness", "goodful", "goodly" (standalone derivations that are
+            # NOT compound words) are excluded.  Genuine compounds like
+            # goodwill / goodbye / goodnight are still matched explicitly.
             "Good":                 ("simple",
-                r"\bgood(?:'?s)?\b"                                         # good, goods, good's
-                r"|\bgood(?:will|night|bye|hearted|looking|natured|humored|ness(?=\s))'?s?\b"  # run-together compounds
-                r"|\bgood-\w+"                                              # hyphenated: good-natured etc.
+                r"\bgood(?!ness\b|ful\b|ly\b)(?:'?s)?\b"                   # good, goods, good's — excludes goodness/goodful/goodly
+                r"|\bgood(?:will|night|bye|hearted|looking|natured|humored)'?s?\b"  # explicit compounds
+                r"|\bgood-\w+"                                              # hyphenated: good-natured, good-humoured, etc.
             ),
 
             # ── 10+ threshold ─────────────────────────────────────────────
-            # america | americas | america's | american | americans | american's
-            # Compound: un-American
-            # ❌ americanize, americanization — derivations
             "America/American":     ("simple",
                 r"\bamericas?\b|\bamerica'?s?\b"
                 r"|\bamericans?\b|\bamerican'?s?\b"
                 r"|\bun-?american'?s?\b"
             ),
 
-            # dude | dudes | dude's
             "Dude":                 ("simple", r"\bdudes?\b|\bdude'?s?\b"),
 
             # ── 3+ threshold ──────────────────────────────────────────────
-            # president | presidents | president's
-            # administration | administrations | administration's
-            # ❌ presidential, presidentially — derivations, NOT counted
             "President/Admin":      ("simple",
                 r"\bpresidents?\b|\bpresident'?s?\b"
                 r"|\badministrations?\b|\badministration'?s?\b"
             ),
 
-            # peace | peaces | peace's
-            # war | wars | war's | compounds: warfare, wartime, warzone, warlord…
-            # ❌ peaceful, peacefully — derivations, NOT counted
             "Peace/War":            ("simple",
                 r"\bpeaces?\b|\bpeace'?s?\b"
                 r"|\bwars?\b|\bwar'?s?\b"
@@ -564,9 +580,6 @@ MARKET_CONFIGS = {
 
             # ── 1+ threshold (default) ────────────────────────────────────
 
-            # addiction | addictions | addiction's
-            # drug | drugs | drug's | compounds: drugstore, drug-free, drug-related…
-            # ❌ addictive, addicted, addicting — derivations
             "Addiction/Drug":       ("simple",
                 r"\baddictions?\b|\baddiction'?s?\b"
                 r"|\bdrugs?\b|\bdrug'?s?\b"
@@ -574,65 +587,48 @@ MARKET_CONFIGS = {
                 r"|\bdrugstore'?s?\b"
             ),
 
-            # criminal | criminals | criminal's
-            # criminalize | criminalize's (base + possessive only)
-            # ❌ criminalization, criminalized, criminalizing — NOT counted
             "Criminal/Criminalize": ("simple",
                 r"\bcriminals?\b|\bcriminal'?s?\b"
                 r"|\bcriminali[sz]e'?s?\b"
             ),
 
-            # amen | amens | amen's
             "Amen":                 ("simple", r"\bamens?\b|\bamen'?s?\b"),
 
-            # kiss | kisses (plural) | kiss's / kiss' (possessive)
-            # ❌ kissed, kissing, kisser — other forms, NOT counted
-            "Kiss":                 ("simple", r"\bkiss\b|\bkisses\b|\bkiss'?s?\b"),
+            # FIX #2: Cleaned up Kiss pattern — removed triple-s ambiguity.
+            # Matches: kiss, kisses (plural), kiss's / kiss' (possessive)
+            # Does NOT match: kissed, kissing, kisser (other derivations)
+            "Kiss":                 ("simple", r"\bkiss(?:es|'?s?)?\b"),
 
-            # UFO | UFOs | UFO's | U.F.O. variants
-            # alien | aliens | alien's
             "UFO/Alien":            ("simple",
                 r"\bUFOs?\b|\bU\.F\.O\.?'?s?\b"
                 r"|\baliens?\b|\balien'?s?\b"
             ),
 
-            # truth | truths | truth's
-            # ❌ truthful, truthfully — derivations, NOT counted
             "Truth":                ("simple", r"\btruths?\b|\btruth'?s?\b"),
 
-            # Exact phrase only — any context counts per rules
             "Black and White":      ("simple", r"\bblack\s+and\s+white\b"),
 
-            # prime minister | prime ministers | prime minister's
-            # NOTE: "PM" is an abbreviation, NOT a compound word → excluded
             "Prime Minister":       ("simple",
                 r"\bprime\s+ministers?\b|\bprime\s+minister'?s?\b"
             ),
 
-            # Full-name: "Donald Trump" = 1 mention (not 2)
-            # Standalone: donald | trump | trumps | trump's
-            # ❌ Trumpism, Trumpian, Trumpist — derivations, NOT counted
             "Donald/Trump":         ("fullname",
                 r"\bdonald\s+trump'?s?\b",
                 r"\b(?:donald'?s?|trumps?\b|trump'?s?)\b"
             ),
 
-            # "Bernie Sanders" = 1 | standalone bernie | sanders
             "Bernie/Sanders":       ("fullname",
                 r"\bbernie\s+sanders'?s?\b",
                 r"\b(?:bernies?\b|bernie'?s?|sanderss?\b|sanders'?s?)\b"
             ),
 
-            # "Hillary Clinton" = 1 | standalone hillary | clinton
             "Hillary/Clinton":      ("fullname",
                 r"\bhillary\s+clinton'?s?\b",
                 r"\b(?:hillarys?\b|hillary'?s?|clintons?\b|clinton'?s?)\b"
             ),
 
-            # AOC | A.O.C. — abbreviation, no plural form expected
             "AOC":                  ("simple", r"\baoc\b|\ba\.o\.c\.?\b"),
 
-            # obama | obamas | obama's
             "Obama":                ("simple", r"\bobamas?\b|\bobama'?s?\b"),
         },
         "thresholds": {
@@ -652,7 +648,6 @@ MARKET_CONFIGS = {
         "channel_key": "mychannel",
         "testing": True,
         "word_groups": {
-            # Count base + plural + possessive only (per Polymarket rules)
             "Hello": ("simple", r"\bhello'?s?\b"),
             "Hi":    ("simple", r"\bhi'?s?\b"),
         },
@@ -713,22 +708,15 @@ def match_market_mrbeast(q: str) -> str | None:
 
 
 def match_market_joerogan(q):
-    """
-    Match a Polymarket question string to a joerogan word_groups category.
-    March 1 week markets.
-    """
     ql = q.lower()
 
-    # ── High-threshold markets (count in question) ────────────────────
     if "good" in ql and "20" in ql:                                    return "Good"
     if ("america" in ql or "american" in ql) and "10" in ql:           return "America/American"
     if "dude" in ql and "10" in ql:                                    return "Dude"
 
-    # ── Medium-threshold markets ──────────────────────────────────────
     if ("president" in ql or "administration" in ql) and "3" in ql:   return "President/Admin"
     if ("peace" in ql or "war" in ql) and "3" in ql:                  return "Peace/War"
 
-    # ── Default-threshold (1+) — order matters for specificity ───────
     if "prime minister" in ql:                                         return "Prime Minister"
     if "black and white" in ql:                                        return "Black and White"
     if "addiction" in ql or "drug" in ql:                              return "Addiction/Drug"
@@ -738,19 +726,17 @@ def match_market_joerogan(q):
     if "ufo" in ql or "alien" in ql:                                   return "UFO/Alien"
     if "truth" in ql:                                                  return "Truth"
     if "donald" in ql or ("trump" in ql and "donald" not in ql):      return "Donald/Trump"
-    # also catch bare "trump" questions
     if "trump" in ql:                                                  return "Donald/Trump"
     if "bernie" in ql or "sanders" in ql:                              return "Bernie/Sanders"
     if "hillary" in ql or "clinton" in ql:                             return "Hillary/Clinton"
     if "aoc" in ql:                                                    return "AOC"
     if "obama" in ql:                                                  return "Obama"
-    # peace/war at threshold 1 (catch questions without "3" in them)
     if "peace" in ql or "war" in ql:                                   return "Peace/War"
     return None
 
 
 def match_market_mychannel(q):
-    return None   # no Polymarket sub-markets for testing
+    return None
 
 def match_market_souravjoshi(q):
     return None
@@ -937,13 +923,6 @@ def format_results(text: str, market_key: str) -> str:
 
 # ─────────────────────────────────────────────
 # AUTO-MONITOR THREAD
-#
-# CHANGES vs original:
-#  • No heartbeat messages — silence until a new video is found
-#  • Polling STOPS immediately when videoCount increases (before transcript fetch)
-#  • Duration=PT0S → waits 20s and retries → defaults to NON-Short if still unknown
-#  • Quota errors send Telegram alerts
-#  • 2-second poll interval recommended
 # ─────────────────────────────────────────────
 
 def monitor_channel(chat_id: int, market_key: str, stop_event: threading.Event):
@@ -960,8 +939,10 @@ def monitor_channel(chat_id: int, market_key: str, stop_event: threading.Event):
         chan_key   = config["channel_key"]
         channel_id = CHANNELS[chan_key]["channel_id"]
         chan_label = config["label"]
+        # FIX #6: read skip_mma flag from config (defaults False for non-JRE markets)
+        skip_mma   = config.get("skip_mma", False)
 
-        log(f"[Monitor] Thread started — market={market_key} channel={channel_id} chat={chat_id}")
+        log(f"[Monitor] Thread started — market={market_key} channel={channel_id} chat={chat_id} skip_mma={skip_mma}")
 
         if not YT_KEYS.available:
             msg = "❌ No YouTube API keys available. Cannot monitor."
@@ -969,12 +950,11 @@ def monitor_channel(chat_id: int, market_key: str, stop_event: threading.Event):
             bot.send_message(chat_id, msg)
             return
 
-        # ── Seed: record current videoCount as baseline ──────────────────
         log(f"[Monitor] Seeding videoCount…")
         last_count = get_video_count(channel_id, chat_id=chat_id)
 
         log(f"[Monitor] Seeding latest video ID…")
-        seed_vid = get_latest_video(channel_id, chat_id=chat_id)
+        seed_vid = get_latest_video(channel_id, chat_id=chat_id, skip_mma=skip_mma)
         last_vid_id = seed_vid["video_id"] if seed_vid else None
 
         log(f"[Monitor] Seed — videoCount={last_count}  latest={last_vid_id}")
@@ -986,15 +966,15 @@ def monitor_channel(chat_id: int, market_key: str, stop_event: threading.Event):
             f"🔑 Keys: <code>{YT_KEYS.status()}</code>\n"
             f"⏱ Polling every <b>{POLL_INTERVAL}s</b>\n"
             f"📊 Seeded count: <code>{last_count}</code>\n"
-            f"📌 Seeded video: <code>{last_vid_id or 'none'}</code>\n\n"
-            f"🔕 <i>No further messages until a new video is detected.</i>\n"
+            f"📌 Seeded video: <code>{last_vid_id or 'none'}</code>\n"
+            + (f"⏭ JRE MMA Show episodes will be <b>skipped</b>.\n" if skip_mma else "")
+            + f"\n🔕 <i>No further messages until a new video is detected.</i>\n"
             f"Use /stop to cancel.",
             parse_mode="HTML",
         )
 
         poll_count = 0
 
-        # ── Main poll loop ──────────────────────────────────────────────
         while not stop_event.is_set():
             stop_event.wait(POLL_INTERVAL)
             if stop_event.is_set():
@@ -1004,11 +984,9 @@ def monitor_channel(chat_id: int, market_key: str, stop_event: threading.Event):
             poll_count += 1
 
             try:
-                # ── Stage 1: cheap videoCount check ──────────────────────
                 new_count = get_video_count(channel_id, chat_id=chat_id)
 
                 if new_count is None:
-                    # API failed — quota hit notification is sent inside mark_exhausted
                     log(f"[Monitor] Poll #{poll_count} — videoCount API failed")
                     if not YT_KEYS.available:
                         log("[Monitor] All keys exhausted — stopping monitor.")
@@ -1019,11 +997,9 @@ def monitor_channel(chat_id: int, market_key: str, stop_event: threading.Event):
                 log(f"[Monitor] Poll #{poll_count} — count={new_count} (was {last_count})")
 
                 if last_count is not None and new_count <= last_count:
-                    # No change — silent (no heartbeat)
                     continue
 
                 # ── Count increased → NEW VIDEO! ──────────────────────────
-                # STOP POLLING IMMEDIATELY so we don't burn quota during fetch
                 stop_event.set()
 
                 t_detected = ist_now()
@@ -1039,14 +1015,15 @@ def monitor_channel(chat_id: int, market_key: str, stop_event: threading.Event):
                     parse_mode="HTML",
                 )
 
-                # ── Stage 2: identify the new video ──────────────────────
-                latest = get_latest_video(channel_id, chat_id=chat_id)
+                latest = get_latest_video(channel_id, chat_id=chat_id, skip_mma=skip_mma)
 
                 if latest is None:
                     log(f"[Monitor] ⚠️  get_latest_video returned None")
                     bot.send_message(
                         chat_id,
-                        f"⚠️ Count increased but couldn't identify the new non-Short video.\n"
+                        f"⚠️ Count increased but couldn't identify the new non-Short"
+                        + (" non-MMA" if skip_mma else "")
+                        + f" video.\n"
                         f"🕐 <code>{ist_now()}</code>\n"
                         f"Use /market to restart monitoring.",
                         parse_mode="HTML",
@@ -1057,12 +1034,13 @@ def monitor_channel(chat_id: int, market_key: str, stop_event: threading.Event):
                 title  = latest["title"]
 
                 if vid_id == last_vid_id:
-                    log(f"[Monitor] ⚠️  Same vid as before ({vid_id}) — likely a Short was uploaded")
+                    log(f"[Monitor] ⚠️  Same vid as before ({vid_id}) — likely a Short/MMA was uploaded")
                     bot.send_message(
                         chat_id,
-                        f"⚠️ Count +1 but latest non-Short is unchanged: <code>{vid_id}</code>\n"
-                        f"Likely a Short was uploaded — monitoring stopped.\n"
-                        f"Use /market to restart.",
+                        f"⚠️ Count +1 but latest eligible video is unchanged: <code>{vid_id}</code>\n"
+                        + ("Likely a Short or JRE MMA Show episode was uploaded.\n" if skip_mma
+                           else "Likely a Short was uploaded.\n")
+                        + f"Monitoring stopped. Use /market to restart.",
                         parse_mode="HTML",
                     )
                     break
@@ -1080,7 +1058,6 @@ def monitor_channel(chat_id: int, market_key: str, stop_event: threading.Event):
                     disable_web_page_preview=True,
                 )
 
-                # ── Transcript ────────────────────────────────────────────
                 t_tr_start = datetime.datetime.utcnow()
                 transcript = fetch_transcript(vid_id)
                 t_tr_end   = datetime.datetime.utcnow()
@@ -1102,7 +1079,6 @@ def monitor_channel(chat_id: int, market_key: str, stop_event: threading.Event):
                 t_tr_done = ist_now()
                 log(f"[Monitor] ✅ Transcript fetched in {tr_secs:.1f}s ({len(transcript):,} chars)")
 
-                # ── Analysis + trades ─────────────────────────────────────
                 t_an_start = datetime.datetime.utcnow()
                 result     = format_results(transcript, market_key)
                 t_an_end   = datetime.datetime.utcnow()
@@ -1131,7 +1107,7 @@ def monitor_channel(chat_id: int, market_key: str, stop_event: threading.Event):
                     f"Use /market to monitor the next video.",
                     parse_mode="HTML",
                 )
-                break   # already stopped via stop_event.set() above
+                break
 
             except Exception as e:
                 tb = traceback.format_exc()
@@ -1147,7 +1123,6 @@ def monitor_channel(chat_id: int, market_key: str, stop_event: threading.Event):
                 except Exception:
                     pass
 
-        # Only send "stopped" if manually stopped (not auto-stopped after detection)
         state = user_state.get(chat_id, {})
         if state.get("mode") == "monitoring":
             bot.send_message(
@@ -1307,7 +1282,7 @@ def handle_callback(call: types.CallbackQuery):
         if config.get("testing"):
             bot.send_message(
                 chat_id,
-                "🧪 <b>Sourav Joshi</b> is in <b>testing mode</b> (no real trades).\n\n"
+                "🧪 <b>Testing mode</b> (no real trades).\n\n"
                 "Do you want to run the bot for the <b>next uploaded video</b>?",
                 parse_mode="HTML",
                 reply_markup=yesno_keyboard("monitor_yes", "monitor_no"),
@@ -1316,7 +1291,8 @@ def handle_callback(call: types.CallbackQuery):
             bot.send_message(
                 chat_id,
                 f"Do you want to auto-monitor for the <b>next video</b> on "
-                f"<b>{config['label']}</b>?",
+                f"<b>{config['label']}</b>?"
+                + ("\n\n⏭ <i>JRE MMA Show episodes will be automatically skipped.</i>" if config.get("skip_mma") else ""),
                 parse_mode="HTML",
                 reply_markup=yesno_keyboard("monitor_yes", "monitor_no"),
             )

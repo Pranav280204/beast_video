@@ -600,13 +600,13 @@ MARKET_CONFIGS = {
             "Kiss":                 ("simple", r"\bkiss(?:es|'?s?)?\b"),
 
             "UFO/Alien":            ("simple",
-                r"\bUFOs?\b|\bU\.F\.O\.?'?s?\b"
+                r"\bUFOs?\b|\bU\.F\.O\.?'?s?\b|\bU\s+F\s+O'?s?\b"   # spoken: "U F O"
                 r"|\baliens?\b|\balien'?s?\b"
             ),
 
             "Truth":                ("simple", r"\btruths?\b|\btruth'?s?\b"),
 
-            "Black and White":      ("simple", r"\bblack\s+and\s+white\b"),
+            "Black and White":      ("simple", r"\bblack[-\s]and[-\s]white\b"),
 
             "Prime Minister":       ("simple",
                 r"\bprime\s+ministers?\b|\bprime\s+minister'?s?\b"
@@ -627,7 +627,7 @@ MARKET_CONFIGS = {
                 r"\b(?:hillarys?\b|hillary'?s?|clintons?\b|clinton'?s?)\b"
             ),
 
-            "AOC":                  ("simple", r"\baoc\b|\ba\.o\.c\.?\b"),
+            "AOC":                  ("simple", r"\baoc\b|\ba\.o\.c\.?\b|\ba\s+o\s+c\b"),
 
             "Obama":                ("simple", r"\bobamas?\b|\bobama'?s?\b"),
         },

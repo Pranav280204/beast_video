@@ -223,7 +223,7 @@ def fetch_transcript(video_id: str) -> str | None:
     try:
         url     = "https://www.youtube-transcript.io/api/transcripts"
         headers = {"Authorization": f"Basic {API_TOKEN}", "Content-Type": "application/json"}
-        r       = requests.post(url, headers=headers, json={"ids": [video_id]}, timeout=30)
+        r       = requests.post(url, headers=headers, json={"ids": [video_id]}, timeout=60)
         r.raise_for_status()
         text = extract_transcript_text(r.json())
         return text if text.strip() else None
@@ -916,7 +916,7 @@ def format_results(text: str, market_key: str) -> str:
     result = f"<b>Polymarket Sniper 🚀</b>\n\n{msg}{poly_section}"
     if trade_results:
         result += f"\n\n<b>🤖 Trades (${max(TRADE_AMOUNT, MIN_TRADE_AMOUNT)}) — started {t_trades_start}</b>\n<pre>"
-        result += "\n".join(trade_results[:10])
+        result += "\n".join(trade_results[:25])
         result += "</pre>"
     return result
 
@@ -1058,19 +1058,39 @@ def monitor_channel(chat_id: int, market_key: str, stop_event: threading.Event):
                     disable_web_page_preview=True,
                 )
 
+                # ── Transcript fetch with retries ────────────────────────
+                # Fresh uploads can take 1-5 min for transcript to be ready.
+                # Retry up to 5 times with 30s gaps before giving up.
+                TRANSCRIPT_RETRIES   = 5
+                TRANSCRIPT_RETRY_GAP = 30   # seconds
+
                 t_tr_start = datetime.datetime.utcnow()
-                transcript = fetch_transcript(vid_id)
-                t_tr_end   = datetime.datetime.utcnow()
-                tr_secs    = (t_tr_end - t_tr_start).total_seconds()
+                transcript = None
+                for attempt in range(1, TRANSCRIPT_RETRIES + 1):
+                    transcript = fetch_transcript(vid_id)
+                    if transcript:
+                        break
+                    if attempt < TRANSCRIPT_RETRIES:
+                        log(f"[Monitor] Transcript not ready (attempt {attempt}/{TRANSCRIPT_RETRIES}). "
+                            f"Waiting {TRANSCRIPT_RETRY_GAP}s...")
+                        bot.send_message(
+                            chat_id,
+                            f"⏳ Transcript not ready yet (attempt {attempt}/{TRANSCRIPT_RETRIES}).\n"
+                            f"Retrying in {TRANSCRIPT_RETRY_GAP}s...",
+                            parse_mode="HTML",
+                        )
+                        time.sleep(TRANSCRIPT_RETRY_GAP)
+                t_tr_end = datetime.datetime.utcnow()
+                tr_secs  = (t_tr_end - t_tr_start).total_seconds()
 
                 if not transcript:
-                    log(f"[Monitor] ⚠️  Transcript not ready for {vid_id}")
+                    log(f"[Monitor] Transcript unavailable after {TRANSCRIPT_RETRIES} attempts for {vid_id}")
                     bot.send_message(
                         chat_id,
-                        f"⚠️ <b>Transcript not ready yet</b>\n"
+                        f"⚠️ <b>Transcript unavailable after {TRANSCRIPT_RETRIES} attempts</b>\n"
                         f"🕐 <code>{ist_now()}</code>\n"
                         f"Video: <a href='https://youtu.be/{vid_id}'>{title}</a>\n\n"
-                        f"Try again manually with /market → paste the URL once transcript is available.",
+                        f"Try again manually with /market and paste the URL.",
                         parse_mode="HTML",
                         disable_web_page_preview=True,
                     )
@@ -1098,7 +1118,18 @@ def monitor_channel(chat_id: int, market_key: str, stop_event: threading.Event):
                     f"</pre>"
                 )
 
-                bot.send_message(chat_id, result + timing_footer, parse_mode="HTML")
+                # Split into two messages to avoid Telegram 4096 char limit
+                try:
+                    bot.send_message(chat_id, result, parse_mode="HTML")
+                except Exception as msg_err:
+                    log(f"[Monitor] Message too long, sending in parts: {msg_err}")
+                    bot.send_message(chat_id, msg, parse_mode="HTML")
+                    if poly_section:
+                        bot.send_message(chat_id, poly_section, parse_mode="HTML")
+                try:
+                    bot.send_message(chat_id, timing_footer, parse_mode="HTML")
+                except Exception:
+                    pass
                 log(f"[Monitor] ✅ Done. Pipeline: {total_secs:.1f}s")
 
                 bot.send_message(

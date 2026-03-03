@@ -63,7 +63,6 @@ class YouTubeKeyRotator:
                     return None  # all keys exhausted
 
     def mark_exhausted(self, key: str, chat_id: int | None = None):
-        """Mark a key as quota-exceeded and optionally notify via Telegram."""
         with self._lock:
             try:
                 idx = self._keys.index(key)
@@ -72,13 +71,11 @@ class YouTubeKeyRotator:
                 msg = (f"⚠️ YouTube key #{idx+1} quota exceeded. "
                        f"{remaining}/{len(self._keys)} keys remaining.")
                 print(msg, flush=True)
-                # Notify on Telegram if we have a chat_id
                 if chat_id and bot:
                     try:
                         bot.send_message(chat_id, msg)
                     except Exception:
                         pass
-                # If ALL keys now exhausted, send a louder warning
                 if remaining == 0 and chat_id and bot:
                     try:
                         bot.send_message(
@@ -108,7 +105,7 @@ class YouTubeKeyRotator:
 YT_KEYS = YouTubeKeyRotator(os.environ.get("YOUTUBE_API_KEY"))
 
 POLYMARKET_SLUG_1  = os.environ.get("POLYMARKET_SLUG",  "what-will-mrbeast-say-during-his-next-youtube-video").strip()
-POLYMARKET_SLUG_2  = os.environ.get("POLYMARKET_SLUG_2","what-will-be-said-on-the-first-joe-rogan-experience-episode-of-the-week-march-1").strip()
+POLYMARKET_SLUG_2  = os.environ.get("POLYMARKET_SLUG_2","what-will-be-said-on-the-first-joe-rogan-experience-episode-of-the-week-march-8").strip()
 
 if not BOT_TOKEN:
     print("ERROR: BOT_TOKEN not set!")
@@ -146,9 +143,6 @@ CHANNELS = {
 
 # ─────────────────────────────────────────────
 # JRE MMA SHOW TITLE FILTER
-# Titles matching this pattern are skipped when
-# monitoring the joerogan channel — only full
-# Joe Rogan Experience episodes count per rules.
 # ─────────────────────────────────────────────
 JRE_MMA_PATTERN = re.compile(r"JRE\s+MMA\s+Show|MMA\s+Show", re.IGNORECASE)
 
@@ -262,11 +256,6 @@ def get_token_id_for_outcome(market, target_outcome: str) -> str | None:
 # ─────────────────────────────────────────────
 
 def _yt_get(url: str, params: dict, chat_id: int | None = None) -> "requests.Response | None":
-    """
-    YouTube Data API GET with key rotation.
-    Retries with next key on 403 (quota exceeded).
-    Sends Telegram alert on quota hit if chat_id provided.
-    """
     if not YT_KEYS.available:
         log("⚠️  All YouTube API keys exhausted.")
         return None
@@ -302,14 +291,12 @@ def _yt_get(url: str, params: dict, chat_id: int | None = None) -> "requests.Res
 
 
 def _uploads_playlist_id(channel_id: str) -> str:
-    """UC… → UU… (YouTube convention, zero API cost)"""
     return "UU" + channel_id[2:]
 
 
 def parse_iso8601_duration(duration: str) -> int:
-    """Convert ISO 8601 duration string to total seconds. Returns -1 for PT0S (unpopulated)."""
     if not duration or duration in ("PT0S", "P0D", ""):
-        return -1   # -1 means "unknown / not yet populated"
+        return -1
     m = re.match(r"PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?", duration)
     if not m:
         return -1
@@ -319,10 +306,6 @@ def parse_iso8601_duration(duration: str) -> int:
 
 
 def get_video_count(channel_id: str, chat_id: int | None = None) -> int | None:
-    """
-    Stage 1 tripwire — returns total video count for a channel.
-    Costs 1 quota unit. Updates instantly on new upload.
-    """
     if not YT_KEYS.available:
         return None
     try:
@@ -348,20 +331,6 @@ def get_video_count(channel_id: str, chat_id: int | None = None) -> int | None:
 
 def get_latest_video(channel_id: str, chat_id: int | None = None,
                      skip_mma: bool = False) -> dict | None:
-    """
-    Stage 2 fetch — called ONLY when videoCount increases.
-    Returns latest non-Shorts video dict {video_id, title} or None.
-    Costs 2 quota units (playlistItems + videos batch).
-
-    skip_mma=True  →  skips any video whose title matches JRE_MMA_PATTERN.
-                       Set this when monitoring the joerogan channel so that
-                       JRE MMA Show episodes are ignored per Polymarket rules.
-
-    FIX: If duration == -1 (PT0S / not yet populated by YouTube),
-    we wait 20 seconds and retry ONCE. If still -1, we assume it is
-    NOT a Short and return it — a 10-minute video should never be dropped
-    just because the API hasn't finished processing its metadata.
-    """
     if not YT_KEYS.available:
         return None
 
@@ -415,7 +384,6 @@ def get_latest_video(channel_id: str, chat_id: int | None = None,
             log("[YT] No candidates from playlist.")
             return None
 
-        # ── FIX #6: Filter out JRE MMA Show episodes when required ──────
         if skip_mma:
             filtered = [(vid, title) for vid, title in candidates
                         if not is_jre_mma_episode(title)]
@@ -429,20 +397,17 @@ def get_latest_video(channel_id: str, chat_id: int | None = None,
 
         durations = _fetch_durations(candidates)
 
-        # ── Check if any duration came back as -1 (PT0S / unpopulated) ──
         unpopulated = [vid for vid, _ in candidates if durations.get(vid, -1) == -1]
         if unpopulated:
             log(f"[YT] ⚠️  {len(unpopulated)} video(s) have PT0S duration (metadata not ready). "
                 f"Waiting 20s then retrying…")
             time.sleep(20)
-            durations = _fetch_durations(candidates)   # retry once
+            durations = _fetch_durations(candidates)
 
-        # ── Return first non-Short ──────────────────────────────────────
         for vid_id, title in candidates:
             secs = durations.get(vid_id, -1)
 
             if secs == -1:
-                # Still unpopulated after retry → ASSUME NOT A SHORT.
                 log(f"[YT]   {vid_id}: duration still unknown → treating as NON-Short ✅")
                 return {"video_id": vid_id, "title": title}
 
@@ -526,117 +491,124 @@ MARKET_CONFIGS = {
         "match_market": "mrbeast",
     },
 
+    # ─────────────────────────────────────────────────────────────────────
+    # JOE ROGAN — updated for week of March 8
+    # Markets:
+    #   "People"          70+
+    #   "Dude"            10+
+    #   "Jamie (3+)"       3+   (also covers the 5+ market via shared count)
+    #   "Jamie (5+)"       5+
+    #   "Alien"            1+
+    #   "Hockey"           1+
+    #   "Trump"            1+
+    #   "Biden"            1+
+    #   "Conspiracy"       1+
+    #   "Iran"             1+
+    #   "Greenland"        1+
+    #   "State of Union"   1+
+    #   "Olympic/Olympics" 1+
+    #   "Epstein"          1+
+    #   "Island"           1+
+    #   "Jackass/Moron"    1+
+    #   "Crypto/Bitcoin"   1+
+    #   "Impossible"       1+
+    #   "Gold/Silver"      1+
+    # ─────────────────────────────────────────────────────────────────────
     "joerogan": {
         "slug":  POLYMARKET_SLUG_2,
         "label": "🎙️ Joe Rogan Experience",
         "channel_key": "joerogan",
         "testing": False,
-        # FIX #6: skip JRE MMA Show episodes during monitoring
         "skip_mma": True,
         "word_groups": {
-            # ─────────────────────────────────────────────────────────────
-            # RESOLUTION RULES (Polymarket):
-            #   ✅ Base form counts
-            #   ✅ Plural (-s) and possessive ('s / s') count
-            #   ✅ Compound words count (goodwill, wartime, drugstore…)
-            #   ❌ Other derivations do NOT (goodness, presidential,
-            #       kissed/kissing, criminalization, peaceful…)
-            #   ❌ Verb conjugations do NOT (criminalizes, kissing…)
-            #   ℹ️  Full-name = 1 count (handled by "fullname" type)
-            # ─────────────────────────────────────────────────────────────
-
-            # ── 20+ threshold ─────────────────────────────────────────────
-            # FIX #1: Added negative lookahead (?!ness\b|ful\b|ly\b) so that
-            # "goodness", "goodful", "goodly" (standalone derivations that are
-            # NOT compound words) are excluded.  Genuine compounds like
-            # goodwill / goodbye / goodnight are still matched explicitly.
-            "Good":                 ("simple",
-                r"\bgood(?!ness\b|ful\b|ly\b)(?:'?s)?\b"                   # good, goods, good's — excludes goodness/goodful/goodly
-                r"|\bgood(?:will|night|bye|hearted|looking|natured|humored)'?s?\b"  # explicit compounds
-                r"|\bgood-\w+"                                              # hyphenated: good-natured, good-humoured, etc.
+            # ── 70+ threshold ─────────────────────────────────────────────
+            "People": ("simple",
+                r"\bpeoples?\b|\bpeople'?s?\b"
             ),
 
             # ── 10+ threshold ─────────────────────────────────────────────
-            "America/American":     ("simple",
-                r"\bamericas?\b|\bamerica'?s?\b"
-                r"|\bamericans?\b|\bamerican'?s?\b"
-                r"|\bun-?american'?s?\b"
+            "Dude": ("simple",
+                r"\bdudes?\b|\bdude'?s?\b"
             ),
 
-            "Dude":                 ("simple", r"\bdudes?\b|\bdude'?s?\b"),
+            # ── 5+ threshold ──────────────────────────────────────────────
+            # Note: Jamie (3+) and Jamie (5+) share the same regex/count;
+            # the Polymarket matcher routes each question to its own key.
+            "Jamie (5+)": ("simple",
+                r"\bjamies?\b|\bjamie'?s?\b"
+            ),
 
             # ── 3+ threshold ──────────────────────────────────────────────
-            "President/Admin":      ("simple",
-                r"\bpresidents?\b|\bpresident'?s?\b"
-                r"|\badministrations?\b|\badministration'?s?\b"
-            ),
-
-            "Peace/War":            ("simple",
-                r"\bpeaces?\b|\bpeace'?s?\b"
-                r"|\bwars?\b|\bwar'?s?\b"
-                r"|\bwar(?:fare|time|zone|lord|head|monger|path|ring|ship|torn)'?s?\b"
-                r"|\bcivil\s+war'?s?\b"
+            "Jamie (3+)": ("simple",
+                r"\bjamies?\b|\bjamie'?s?\b"
             ),
 
             # ── 1+ threshold (default) ────────────────────────────────────
-
-            "Addiction/Drug":       ("simple",
-                r"\baddictions?\b|\baddiction'?s?\b"
-                r"|\bdrugs?\b|\bdrug'?s?\b"
-                r"|\bdrug-\w+"
-                r"|\bdrugstore'?s?\b"
+            "Alien": ("simple",
+                r"\baliens?\b|\balien'?s?\b"
             ),
 
-            "Criminal/Criminalize": ("simple",
-                r"\bcriminals?\b|\bcriminal'?s?\b"
-                r"|\bcriminali[sz]e'?s?\b"
+            "Hockey": ("simple",
+                r"\bhockeys?\b|\bhockey'?s?\b"
             ),
 
-            "Amen":                 ("simple", r"\bamens?\b|\bamen'?s?\b"),
-
-            # FIX #2: Cleaned up Kiss pattern — removed triple-s ambiguity.
-            # Matches: kiss, kisses (plural), kiss's / kiss' (possessive)
-            # Does NOT match: kissed, kissing, kisser (other derivations)
-            "Kiss":                 ("simple", r"\bkiss(?:es|'?s?)?\b"),
-
-            "UFO/Alien":            ("simple",
-                r"\bUFOs?\b|\bU\.F\.O\.?'?s?\b|\bU\s+F\s+O'?s?\b"   # spoken: "U F O"
-                r"|\baliens?\b|\balien'?s?\b"
+            "Trump": ("simple",
+                r"\btrumps?\b|\btrump'?s?\b"
             ),
 
-            "Truth":                ("simple", r"\btruths?\b|\btruth'?s?\b"),
-
-            "Black and White":      ("simple", r"\bblack[-\s]and[-\s]white\b"),
-
-            "Prime Minister":       ("simple",
-                r"\bprime\s+ministers?\b|\bprime\s+minister'?s?\b"
+            "Biden": ("simple",
+                r"\bbidens?\b|\bbiden'?s?\b"
             ),
 
-            "Donald/Trump":         ("fullname",
-                r"\bdonald\s+trump'?s?\b",
-                r"\b(?:donald'?s?|trumps?\b|trump'?s?)\b"
+            "Conspiracy": ("simple",
+                r"\bconspirac(?:y|ies)'?s?\b"
             ),
 
-            "Bernie/Sanders":       ("fullname",
-                r"\bbernie\s+sanders'?s?\b",
-                r"\b(?:bernies?\b|bernie'?s?|sanderss?\b|sanders'?s?)\b"
+            "Iran": ("simple",
+                r"\birans?\b|\biran'?s?\b"
             ),
 
-            "Hillary/Clinton":      ("fullname",
-                r"\bhillary\s+clinton'?s?\b",
-                r"\b(?:hillarys?\b|hillary'?s?|clintons?\b|clinton'?s?)\b"
+            "Greenland": ("simple",
+                r"\bgreenlands?\b|\bgreenland'?s?\b"
             ),
 
-            "AOC":                  ("simple", r"\baoc\b|\ba\.o\.c\.?\b|\ba\s+o\s+c\b"),
+            "State of Union": ("simple",
+                r"\bstate\s+of\s+the\s+union'?s?\b"
+            ),
 
-            "Obama":                ("simple", r"\bobamas?\b|\bobama'?s?\b"),
+            "Olympic/Olympics": ("simple",
+                r"\bolympics?'?s?\b"
+            ),
+
+            "Epstein": ("simple",
+                r"\bepsteins?\b|\bepstein'?s?\b"
+            ),
+
+            "Island": ("simple",
+                r"\bislands?\b|\bisland'?s?\b"
+            ),
+
+            "Jackass/Moron": ("simple",
+                r"\bjackass(?:es)?\b|\bmorons?\b|\bmoron'?s?\b"
+            ),
+
+            "Crypto/Bitcoin": ("simple",
+                r"\bcryptos?\b|\bcrypto'?s?\b|\bbitcoins?\b|\bbitcoin'?s?\b"
+            ),
+
+            "Impossible": ("simple",
+                r"\bimpossible'?s?\b"
+            ),
+
+            "Gold/Silver": ("simple",
+                r"\bgolds?\b|\bgold'?s?\b|\bsilvers?\b|\bsilver'?s?\b"
+            ),
         },
         "thresholds": {
-            "Good":             20,
-            "America/American": 10,
-            "Dude":             10,
-            "President/Admin":   3,
-            "Peace/War":         3,
+            "People":     70,
+            "Dude":       10,
+            "Jamie (5+)":  5,
+            "Jamie (3+)":  3,
         },
         "default_threshold": 1,
         "match_market": "joerogan",
@@ -707,31 +679,35 @@ def match_market_mrbeast(q: str) -> str | None:
     return None
 
 
-def match_market_joerogan(q):
+def match_market_joerogan(q: str) -> str | None:
+    """
+    Maps each Polymarket question string → word_groups key for the JRE market.
+    Order matters: more-specific / threshold-based checks come first.
+    """
     ql = q.lower()
 
-    if "good" in ql and "20" in ql:                                    return "Good"
-    if ("america" in ql or "american" in ql) and "10" in ql:           return "America/American"
-    if "dude" in ql and "10" in ql:                                    return "Dude"
+    # Threshold-based (must check count hint in question text)
+    if "people" in ql and "70"  in ql:          return "People"
+    if "dude"   in ql and "10"  in ql:          return "Dude"
+    if "jamie"  in ql and "5"   in ql:          return "Jamie (5+)"
+    if "jamie"  in ql and "3"   in ql:          return "Jamie (3+)"
 
-    if ("president" in ql or "administration" in ql) and "3" in ql:   return "President/Admin"
-    if ("peace" in ql or "war" in ql) and "3" in ql:                  return "Peace/War"
-
-    if "prime minister" in ql:                                         return "Prime Minister"
-    if "black and white" in ql:                                        return "Black and White"
-    if "addiction" in ql or "drug" in ql:                              return "Addiction/Drug"
-    if "criminal" in ql or "criminalize" in ql:                        return "Criminal/Criminalize"
-    if "amen" in ql:                                                   return "Amen"
-    if "kiss" in ql:                                                   return "Kiss"
-    if "ufo" in ql or "alien" in ql:                                   return "UFO/Alien"
-    if "truth" in ql:                                                  return "Truth"
-    if "donald" in ql or ("trump" in ql and "donald" not in ql):      return "Donald/Trump"
-    if "trump" in ql:                                                  return "Donald/Trump"
-    if "bernie" in ql or "sanders" in ql:                              return "Bernie/Sanders"
-    if "hillary" in ql or "clinton" in ql:                             return "Hillary/Clinton"
-    if "aoc" in ql:                                                    return "AOC"
-    if "obama" in ql:                                                  return "Obama"
-    if "peace" in ql or "war" in ql:                                   return "Peace/War"
+    # 1+ markets — order: longest/most-specific phrase first
+    if "state of the union"             in ql:  return "State of Union"
+    if "jackass" in ql or "moron"       in ql:  return "Jackass/Moron"
+    if "crypto"  in ql or "bitcoin"     in ql:  return "Crypto/Bitcoin"
+    if "gold"    in ql or "silver"      in ql:  return "Gold/Silver"
+    if "olympic"                        in ql:  return "Olympic/Olympics"
+    if "greenland"                      in ql:  return "Greenland"
+    if "epstein"                        in ql:  return "Epstein"
+    if "conspiracy"                     in ql:  return "Conspiracy"
+    if "impossible"                     in ql:  return "Impossible"
+    if "island"                         in ql:  return "Island"
+    if "hockey"                         in ql:  return "Hockey"
+    if "alien"                          in ql:  return "Alien"
+    if "trump"                          in ql:  return "Trump"
+    if "biden"                          in ql:  return "Biden"
+    if "iran"                           in ql:  return "Iran"
     return None
 
 
@@ -939,7 +915,6 @@ def monitor_channel(chat_id: int, market_key: str, stop_event: threading.Event):
         chan_key   = config["channel_key"]
         channel_id = CHANNELS[chan_key]["channel_id"]
         chan_label = config["label"]
-        # FIX #6: read skip_mma flag from config (defaults False for non-JRE markets)
         skip_mma   = config.get("skip_mma", False)
 
         log(f"[Monitor] Thread started — market={market_key} channel={channel_id} chat={chat_id} skip_mma={skip_mma}")
@@ -999,7 +974,6 @@ def monitor_channel(chat_id: int, market_key: str, stop_event: threading.Event):
                 if last_count is not None and new_count <= last_count:
                     continue
 
-                # ── Count increased → NEW VIDEO! ──────────────────────────
                 stop_event.set()
 
                 t_detected = ist_now()
@@ -1058,11 +1032,8 @@ def monitor_channel(chat_id: int, market_key: str, stop_event: threading.Event):
                     disable_web_page_preview=True,
                 )
 
-                # ── Transcript fetch with retries ────────────────────────
-                # Fresh uploads can take 1-5 min for transcript to be ready.
-                # Retry up to 5 times with 30s gaps before giving up.
                 TRANSCRIPT_RETRIES   = 5
-                TRANSCRIPT_RETRY_GAP = 30   # seconds
+                TRANSCRIPT_RETRY_GAP = 30
 
                 t_tr_start = datetime.datetime.utcnow()
                 transcript = None
@@ -1118,7 +1089,6 @@ def monitor_channel(chat_id: int, market_key: str, stop_event: threading.Event):
                     f"</pre>"
                 )
 
-                # Split into two messages to avoid Telegram 4096 char limit
                 try:
                     bot.send_message(chat_id, result, parse_mode="HTML")
                 except Exception as msg_err:

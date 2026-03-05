@@ -104,7 +104,7 @@ class YouTubeKeyRotator:
 
 YT_KEYS = YouTubeKeyRotator(os.environ.get("YOUTUBE_API_KEY"))
 
-POLYMARKET_SLUG_1  = os.environ.get("POLYMARKET_SLUG",  "what-will-mrbeast-say-during-his-next-youtube-video").strip()
+POLYMARKET_SLUG_1  = os.environ.get("POLYMARKET_SLUG",  "what-will-mrbeast-say-during-his-next-youtube-video-684").strip()
 POLYMARKET_SLUG_2  = os.environ.get("POLYMARKET_SLUG_2","what-will-be-said-on-the-first-joe-rogan-experience-episode-of-the-week-march-8").strip()
 
 if not BOT_TOKEN:
@@ -453,40 +453,49 @@ MARKET_CONFIGS = {
         "label": "🎬 MrBeast YouTube",
         "channel_key": "mrbeast",
         "testing": False,
+        # ── Markets for slug: what-will-mrbeast-say-during-his-next-youtube-video-684
+        # Dollar           10+
+        # Thousand/Million  5+
+        # Contestant        1+
+        # Challenge         1+
+        # Insane            1+
+        # Impossible        1+
+        # Donated/Raised    1+
+        # Car/Supercar      1+
+        # Jet               1+
+        # Briefcase         1+
+        # Island            1+
+        # Prize             1+
+        # Feastables        1+
+        # MrBeast           1+
+        # Subscribe         1+
         "word_groups": {
-            "Dollar":                   ("simple",
+            "Dollar":           ("simple",
                 r"\bdollar'?s?\b"
                 r"|\$\s*[\d,]+(?:\.\d+)?"
                 r"|\$\s*(?:one|two|three|four|five|six|seven|eight|nine|ten|"
                 r"twenty|thirty|forty|fifty|sixty|seventy|eighty|ninety|"
                 r"hundred|thousand|million|billion|trillion)"
             ),
-            "Thousand/Million":         ("simple", r"\b(thousand|million|billion)'?s?\b"),
-            "Challenge":                ("simple", r"\bchallenge'?s?\b"),
-            "Eliminated":               ("simple", r"\beliminated'?s?\b"),
-            "Trap":                     ("simple",
-                r"\btrap'?s?\b"
-                r"|\btrapdoor'?s?\b"
-                r"|\b(?:death|fire|fly|rat|mouse|man|speed|tourist|poverty|"
-                r"sun|net|steam|wind|cold|heat|love|mind|speed)trap'?s?\b"
-                r"|\bbooby[\s\-]trap'?s?\b"
-            ),
-            "Car/Supercar":             ("simple", r"\b\w*car'?s?\b"),
-            "Tesla/Lamborghini":        ("simple", r"\b(tesla|lamborghini)'?s?\b"),
-            "Helicopter/Jet":           ("simple", r"\bhelicopter'?s?\b|\bjet\w*'?s?\b"),
-            "Island":                   ("simple", r"\bisland'?s?\b"),
-            "Mystery Box":              ("simple", r"\bmystery\s+box(?:es|'?s)?\b"),
-            "Massive":                  ("simple", r"\bmassive'?s?\b"),
-            "World's Biggest/Largest":  ("simple", r"\bworld'?s?\s+(biggest|largest)\b"),
-            "Beast Games":              ("simple", r"\bbeast\s+games?\b"),
-            "Feastables":               ("simple", r"\bfeastables?'?s?\b"),
-            "MrBeast":                  ("simple", r"\bmr\.?\s*beast'?s?\b"),
-            "Insane":                   ("simple", r"\binsane'?s?\b"),
-            "Subscribe":                ("simple", r"\bsubscribe'?s?\b"),
-            "Cocoa":                    ("simple", r"\bcocoa'?s?\b"),
-            "Chocolate":                ("simple", r"\bchocolate'?s?\b"),
+            "Thousand/Million": ("simple", r"\b(thousand|million|billion)'?s?\b"),
+            "Contestant":       ("simple", r"\bcontestants?\b|\bcontestant'?s?\b"),
+            "Challenge":        ("simple", r"\bchallenge'?s?\b"),
+            "Insane":           ("simple", r"\binsane'?s?\b"),
+            "Impossible":       ("simple", r"\bimpossible'?s?\b"),
+            "Donated/Raised":   ("simple", r"\bdonated\b|\braised\b"),
+            "Car/Supercar":     ("simple", r"\b(?:super)?car'?s?\b"),
+            "Jet":              ("simple", r"\bjets?\b|\bjet'?s?\b"),
+            "Briefcase":        ("simple", r"\bbriefcases?\b|\bbriefcase'?s?\b"),
+            "Island":           ("simple", r"\bislands?\b|\bisland'?s?\b"),
+            "Prize":            ("simple", r"\bprizes?\b|\bprize'?s?\b"),
+            "Feastables":       ("simple", r"\bfeastables?'?s?\b"),
+            "MrBeast":          ("simple", r"\bmr\.?\s*beast'?s?\b"),
+            "Subscribe":        ("simple", r"\bsubscribe'?s?\b"),
         },
-        "thresholds": {"Dollar": 10, "Thousand/Million": 10, "Cocoa": 3, "Chocolate": 3},
+        "thresholds": {
+            "Dollar":           10,
+            "Thousand/Million":  5,
+        },
         "default_threshold": 1,
         "match_market": "mrbeast",
     },
@@ -649,33 +658,28 @@ MARKET_CONFIGS = {
 
 def match_market_mrbeast(q: str) -> str | None:
     ql = q.lower()
-    m = re.search(r"\bsay\s+(.+?)(?:\s+\d+\+\s+times?|\s+during\b)", ql)
+    m = re.search(r"\bsay\s+(.+?)(?:\s+\d+\+?\s+times?|\s+during\b)", ql)
     term = m.group(1).strip() if m else ql
 
-    if "beast games"                      in term: return "Beast Games"
-    if "mystery box"                      in term: return "Mystery Box"
-    if "world" in term and ("biggest" in term or "largest" in term):
-                                                   return "World's Biggest/Largest"
-    if "tesla"        in term:                     return "Tesla/Lamborghini"
-    if "lamborghini"  in term:                     return "Tesla/Lamborghini"
-    if "helicopter"   in term:                     return "Helicopter/Jet"
-    if "jet"          in term:                     return "Helicopter/Jet"
-    if "thousand"     in term or "million" in term or "billion" in term:
-                                                   return "Thousand/Million"
-    if "dollar"       in term:                     return "Dollar"
-    if "subscribe"    in term:                     return "Subscribe"
-    if "insane"       in term:                     return "Insane"
-    if "feastables"   in term:                     return "Feastables"
-    if "cocoa"        in term:                     return "Cocoa"
-    if "chocolate"    in term:                     return "Chocolate"
-    if "mr" in term and "beast" in term:           return "MrBeast"
-    if "mrbeast"      in term:                     return "MrBeast"
-    if "eliminated"   in term:                     return "Eliminated"
-    if "challenge"    in term:                     return "Challenge"
-    if "massive"      in term:                     return "Massive"
-    if "island"       in term:                     return "Island"
-    if "trap"         in term:                     return "Trap"
-    if "car"          in term:                     return "Car/Supercar"
+    # Specific multi-word / compound checks first
+    if "thousand" in term or "million" in term or "billion" in term:
+                                                    return "Thousand/Million"
+    if "donated"    in term or "raised"  in term:  return "Donated/Raised"
+    if "supercar"   in term:                        return "Car/Supercar"
+    if "briefcase"  in term:                        return "Briefcase"
+    if "contestant" in term:                        return "Contestant"
+    if "feastables" in term:                        return "Feastables"
+    if "impossible" in term:                        return "Impossible"
+    if "subscribe"  in term:                        return "Subscribe"
+    if "challenge"  in term:                        return "Challenge"
+    if "insane"     in term:                        return "Insane"
+    if "island"     in term:                        return "Island"
+    if "prize"      in term:                        return "Prize"
+    if "dollar"     in term:                        return "Dollar"
+    if "car"        in term:                        return "Car/Supercar"
+    if "jet"        in term:                        return "Jet"
+    if ("mr" in term and "beast" in term) or "mrbeast" in term:
+                                                    return "MrBeast"
     return None
 
 
@@ -974,50 +978,50 @@ def monitor_channel(chat_id: int, market_key: str, stop_event: threading.Event):
                 if last_count is not None and new_count <= last_count:
                     continue
 
-                stop_event.set()
-
+                # ── Count increased — check whether it's a real video ────
                 t_detected = ist_now()
                 diff = (new_count - last_count) if last_count else 1
-                log(f"[Monitor] 🆕 videoCount {last_count}→{new_count} (+{diff}) at {t_detected}")
+                log(f"[Monitor] 🆕 videoCount {last_count}->{new_count} (+{diff}) at {t_detected}")
 
                 bot.send_message(
                     chat_id,
-                    f"🔔 <b>New upload detected!</b>\n"
-                    f"🕐 <code>{t_detected}</code>\n"
-                    f"📊 videoCount: <code>{last_count} → {new_count}</code>\n"
-                    f"⏳ Fetching video details…",
+                    f"🔔 <b>Upload detected!</b> Checking if Short/MMA...\n"
+                    f"<code>{t_detected}</code> | videoCount: <code>{last_count} -> {new_count}</code>",
                     parse_mode="HTML",
                 )
 
                 latest = get_latest_video(channel_id, chat_id=chat_id, skip_mma=skip_mma)
 
+                # ── All candidates were Shorts/MMA — keep monitoring ─────
                 if latest is None:
-                    log(f"[Monitor] ⚠️  get_latest_video returned None")
+                    log(f"[Monitor] Short/MMA upload detected — updating count and continuing.")
                     bot.send_message(
                         chat_id,
-                        f"⚠️ Count increased but couldn't identify the new non-Short"
-                        + (" non-MMA" if skip_mma else "")
-                        + f" video.\n"
-                        f"🕐 <code>{ist_now()}</code>\n"
-                        f"Use /market to restart monitoring.",
+                        f"<b>Short" + ("/MMA" if skip_mma else "") + f" uploaded — skipping.</b>\n"
+                        f"videoCount updated to <code>{new_count}</code>. Still watching...",
                         parse_mode="HTML",
                     )
-                    break
+                    last_count = new_count
+                    continue
 
                 vid_id = latest["video_id"]
                 title  = latest["title"]
 
+                # ── Same video as seed → Short/MMA was the upload ────────
                 if vid_id == last_vid_id:
-                    log(f"[Monitor] ⚠️  Same vid as before ({vid_id}) — likely a Short/MMA was uploaded")
+                    log(f"[Monitor] Latest eligible video unchanged ({vid_id}) — Short/MMA, continuing.")
                     bot.send_message(
                         chat_id,
-                        f"⚠️ Count +1 but latest eligible video is unchanged: <code>{vid_id}</code>\n"
-                        + ("Likely a Short or JRE MMA Show episode was uploaded.\n" if skip_mma
-                           else "Likely a Short was uploaded.\n")
-                        + f"Monitoring stopped. Use /market to restart.",
+                        f"<b>Short" + ("/MMA" if skip_mma else "") + f" uploaded — skipping.</b>\n"
+                        f"Latest eligible video still: <code>{vid_id}</code>\n"
+                        f"videoCount updated to <code>{new_count}</code>. Still watching...",
                         parse_mode="HTML",
                     )
-                    break
+                    last_count = new_count
+                    continue
+
+                # ── Confirmed real new video — stop the monitor loop ─────
+                stop_event.set()
 
                 t_video_detected = ist_now()
                 log(f"[Monitor] ✅ New video confirmed: {vid_id} | {title}")
